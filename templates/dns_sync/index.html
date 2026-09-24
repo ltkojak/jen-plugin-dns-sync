@@ -1,0 +1,262 @@
+{% extends "base.html" %}
+{% block title %}DNS Sync{% endblock %}
+{% block content %}
+
+<div class="page-header flex items-center between wrap gap-3">
+    <div>
+        <h1>{{ icon("globe", "ico-lg") }} DNS Sync</h1>
+        <p>Pushes DHCP names into Pi-hole or AdGuard Home local DNS, so names like <span class="mono small">nas.lan</span> resolve without Kea DDNS.</p>
+    </div>
+    {% if is_admin %}
+    <button id="ds-add-btn" class="btn btn-primary">{{ icon("plus") }} Add Target</button>
+    {% endif %}
+</div>
+
+{% if ipv6_enabled %}
+<div class="alert alert-info">{{ icon("info") }} DNS Sync tracks IPv4 addresses only.</div>
+{% endif %}
+
+<div class="card" style="padding:0;">
+<div class="table-wrap">
+<table id="ds-table" class="rowlist">
+    <thead><tr>
+        <th>Target</th>
+        <th>Status</th>
+        <th>Sources</th>
+        <th>Records</th>
+        <th>Last sync</th>
+        <th></th>
+    </tr></thead>
+    <tbody>
+    {% for r in rows %}
+    <tr>
+        <td data-m="primary">
+            {{ r.name }}
+            <span class="small muted">({{ r.kind }} · {{ r.url }})</span>
+        </td>
+        <td data-m="badge">
+            {% if not r.previewed_at %}<span class="muted">{{ icon("eye") }} Needs preview</span>
+            {% elif r.enabled %}<span class="ok">{{ icon("circle-check") }} Enabled</span>
+            {% else %}<span class="muted">{{ icon("circle") }} Paused</span>{% endif %}
+            {% if r.last_error %}<span class="bad small" title="{{ r.last_error }}">{{ icon("triangle-alert") }}</span>{% endif %}
+        </td>
+        <td data-m="hide" class="small">{{ r.sources.replace(',', ', ') }}</td>
+        <td data-m="hide">
+            <a href="#" class="ds-records-link" data-id="{{ r.id }}" data-name="{{ r.name }}">{{ r.record_count }}</a>
+        </td>
+        <td class="small muted" data-m="hide">{{ r.last_sync_at | utcfmt if r.last_sync_at else '—' }}</td>
+        <td data-m="trailing">
+            <div class="flex gap-1 items-center">
+                <a class="btn btn-sm btn-secondary" title="Export Unbound local-data" aria-label="Export Unbound local-data" href="{{ url_for('dns_sync.export_unbound', target_id=r.id) }}">{{ icon("download") }}</a>
+                {% if is_admin %}
+                <button class="btn btn-sm btn-secondary ds-preview-btn" title="Preview" aria-label="Preview" data-id="{{ r.id }}" data-name="{{ r.name }}">{{ icon("eye") }}</button>
+                <form method="POST" action="{{ url_for('dns_sync.toggle_target', target_id=r.id) }}" class="contents">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <button type="submit" class="btn btn-sm btn-secondary" title="{{ 'Pause' if r.enabled else 'Enable' }}" aria-label="{{ 'Pause' if r.enabled else 'Enable' }}">
+                        {{ icon("timer") if r.enabled else icon("play") }}
+                    </button>
+                </form>
+                <form method="POST" action="{{ url_for('dns_sync.delete_target', target_id=r.id) }}" class="contents"
+                      data-confirm="Remove {{ r.name }}? Jen will not delete its records from the remote server.">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <button type="submit" class="btn btn-sm btn-secondary bad" title="Delete" aria-label="Delete">{{ icon("trash") }}</button>
+                </form>
+                {% endif %}
+            </div>
+        </td>
+    </tr>
+    {% endfor %}
+    {% if not rows %}
+    <tr><td data-m="full" colspan="6" class="center muted">No targets yet. {% if is_admin %}Add one above.{% endif %}</td></tr>
+    {% endif %}
+    </tbody>
+</table>
+</div>
+</div>
+
+{% if is_admin %}
+<div id="ds-add-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:500;align-items:center;justify-content:center;">
+<div class="card" style="width:min(480px,94vw);max-height:90vh;overflow-y:auto;">
+    <div class="flex between items-center mb-3">
+        <h3>{{ icon("plus") }} Add Target</h3>
+        <button id="ds-add-close-btn" class="btn btn-sm btn-secondary" aria-label="Close">{{ icon("x") }}</button>
+    </div>
+    <form method="POST" action="{{ url_for('dns_sync.add_target') }}" id="ds-add-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <div class="form-group">
+            <label>Name</label>
+            <input type="text" name="name" maxlength="100" required autocomplete="off" placeholder="Pi-hole (front closet)">
+        </div>
+        <div class="form-row">
+            <div class="form-group">
+                <label>Server</label>
+                <select name="kind" required>
+                    {% for k in kinds %}
+                    <option value="{{ k }}">{{ 'Pi-hole' if k == 'pihole' else 'AdGuard Home' }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="form-group">
+                <label>Domain suffix</label>
+                <input type="text" name="domain" value="lan" maxlength="63" autocomplete="off">
+            </div>
+        </div>
+        <div class="form-group">
+            <label>URL</label>
+            <input type="text" name="url" required autocomplete="off" placeholder="http://pi.hole">
+        </div>
+        <div class="form-group">
+            <label id="ds-credential-label">Password</label>
+            <input type="password" name="credential" autocomplete="new-password">
+            <div class="form-hint">Stored encrypted; never shown again once saved. AdGuard Home: enter as <span class="mono">user:pass</span>.</div>
+        </div>
+        <div class="form-group">
+            <label><input type="checkbox" name="allow_self_signed"> Allow a self-signed certificate</label>
+        </div>
+        <div class="form-group">
+            <label>Sources</label>
+            {% for s in sources %}
+            <label class="flex items-center gap-1"><input type="checkbox" name="sources" value="{{ s }}" {% if s != 'ipam' %}checked{% endif %}> {{ s }}</label>
+            {% endfor %}
+        </div>
+        <div class="form-group">
+            <label><input type="checkbox" name="scope_all" checked id="ds-scope-all"> All subnets I can access</label>
+        </div>
+        <div class="form-group" id="ds-subnet-picker" style="display:none;">
+            <label>Subnets</label>
+            {% for s in accessible_subnets %}
+            <label class="flex items-center gap-1"><input type="checkbox" name="subnet_ids" value="{{ s.id }}"> {{ s.name }}</label>
+            {% endfor %}
+        </div>
+        <div class="flex gap-2 mt-3">
+            <button type="submit" class="btn btn-primary">Add Target</button>
+            <button type="button" id="ds-add-cancel-btn" class="btn btn-secondary">Cancel</button>
+        </div>
+    </form>
+</div>
+</div>
+{% endif %}
+
+<div id="ds-preview-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:500;align-items:center;justify-content:center;">
+<div class="card" style="width:min(560px,94vw);max-height:85vh;overflow-y:auto;">
+    <div class="flex between items-center mb-3">
+        <h3>{{ icon("eye") }} Preview — <span id="ds-preview-title"></span></h3>
+        <button id="ds-preview-close-btn" class="btn btn-sm btn-secondary" aria-label="Close">{{ icon("x") }}</button>
+    </div>
+    <div id="ds-preview-body" class="small">Loading…</div>
+</div>
+</div>
+
+<div id="ds-records-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:500;align-items:center;justify-content:center;">
+<div class="card" style="width:min(480px,94vw);max-height:80vh;overflow-y:auto;">
+    <div class="flex between items-center mb-3">
+        <h3>{{ icon("globe") }} Records — <span id="ds-records-title"></span></h3>
+        <button id="ds-records-close-btn" class="btn btn-sm btn-secondary" aria-label="Close">{{ icon("x") }}</button>
+    </div>
+    <div id="ds-records-body" class="small">Loading…</div>
+</div>
+</div>
+
+<script nonce="{{ csp_nonce }}">
+function _dsModal(id, show) {
+    document.getElementById(id).style.display = show ? 'flex' : 'none';
+}
+
+{% if is_admin %}
+document.getElementById('ds-add-btn').addEventListener('click', function() { _dsModal('ds-add-modal', true); });
+document.getElementById('ds-add-close-btn').addEventListener('click', function() { _dsModal('ds-add-modal', false); });
+document.getElementById('ds-add-cancel-btn').addEventListener('click', function() { _dsModal('ds-add-modal', false); });
+document.getElementById('ds-add-modal').addEventListener('click', function(e) { if (e.target === this) _dsModal('ds-add-modal', false); });
+
+document.querySelector('select[name="kind"]').addEventListener('change', function() {
+    document.getElementById('ds-credential-label').textContent = this.value === 'adguard' ? 'Credentials' : 'Password';
+});
+document.getElementById('ds-scope-all').addEventListener('change', function() {
+    document.getElementById('ds-subnet-picker').style.display = this.checked ? 'none' : '';
+});
+
+document.querySelectorAll('.ds-preview-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+        var id = this.getAttribute('data-id');
+        document.getElementById('ds-preview-title').textContent = this.getAttribute('data-name');
+        var body = document.getElementById('ds-preview-body');
+        body.textContent = 'Running preview…';
+        _dsModal('ds-preview-modal', true);
+        this.disabled = true;
+        this.setAttribute('aria-busy', 'true');
+        var thisBtn = this;
+        window.jenFetch('/network/dns-sync/targets/' + id + '/preview', {
+            method: 'POST',
+            headers: {'X-CSRFToken': '{{ csrf_token() }}'}
+        })
+            .then(function(r) { return r.json(); })
+            .then(function(d) {
+                if (d.error) { body.textContent = 'Error: ' + d.error; return; }
+                var html = '';
+                if (d.remote_error) {
+                    html += '<div class="alert alert-warning">' + escapeHtml(d.remote_error) + '</div>';
+                }
+                function section(title, items, render) {
+                    html += '<h4>' + title + ' (' + items.length + ')</h4>';
+                    if (!items.length) { html += '<p class="muted">None.</p>'; return; }
+                    html += '<ul>';
+                    items.forEach(function(it) { html += '<li class="mono">' + render(it) + '</li>'; });
+                    html += '</ul>';
+                }
+                section('Add', d.add, function(it) { return escapeHtml(it[0]) + ' → ' + escapeHtml(it[1]); });
+                section('Update', d.update, function(it) { return escapeHtml(it[0]) + ' → ' + escapeHtml(it[1]); });
+                section('Remove', d.remove, function(it) { return escapeHtml(it); });
+                if (d.skipped && d.skipped.length) {
+                    html += '<h4>Skipped (' + d.skipped.length + ')</h4><ul>';
+                    d.skipped.forEach(function(s) {
+                        html += '<li class="muted">' + escapeHtml(s.ip) + ' (' + escapeHtml(s.raw) + '): ' + escapeHtml(s.reason) + '</li>';
+                    });
+                    html += '</ul>';
+                }
+                html += '<p class="small muted">Preview recorded — this target can now be enabled.</p>';
+                body.innerHTML = html;
+            })
+            .catch(function() { body.textContent = 'Preview failed.'; })
+            .finally(function() { thisBtn.disabled = false; thisBtn.removeAttribute('aria-busy'); });
+    });
+});
+{% endif %}
+
+document.querySelectorAll('.ds-records-link').forEach(function(a) {
+    a.addEventListener('click', function(e) {
+        e.preventDefault();
+        var id = this.getAttribute('data-id');
+        document.getElementById('ds-records-title').textContent = this.getAttribute('data-name');
+        var body = document.getElementById('ds-records-body');
+        body.textContent = 'Loading…';
+        _dsModal('ds-records-modal', true);
+        window.jenFetch('/network/dns-sync/targets/' + id + '/records', {cache: 'no-store'})
+            .then(function(r) { return r.ok ? r.json() : {rows: []}; })
+            .catch(function() { return {rows: []}; })
+            .then(function(d) {
+                var rows = (d && d.rows) || [];
+                if (!rows.length) { body.textContent = 'No records for this target yet.'; return; }
+                var html = '<table class="rowlist"><thead><tr><th>Name</th><th>IP</th><th>Source</th></tr></thead><tbody>';
+                rows.forEach(function(r) {
+                    html += '<tr><td class="mono">' + escapeHtml(r.name) + '</td><td class="mono">' + escapeHtml(r.ip) +
+                            '</td><td>' + escapeHtml(r.source) + '</td></tr>';
+                });
+                html += '</tbody></table>';
+                body.innerHTML = html;
+            });
+    });
+});
+document.getElementById('ds-records-close-btn').addEventListener('click', function() { _dsModal('ds-records-modal', false); });
+document.getElementById('ds-records-modal').addEventListener('click', function(e) { if (e.target === this) _dsModal('ds-records-modal', false); });
+document.getElementById('ds-preview-close-btn').addEventListener('click', function() { _dsModal('ds-preview-modal', false); });
+document.getElementById('ds-preview-modal').addEventListener('click', function(e) { if (e.target === this) _dsModal('ds-preview-modal', false); });
+document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape') {
+        _dsModal('ds-records-modal', false);
+        _dsModal('ds-preview-modal', false);
+        {% if is_admin %}_dsModal('ds-add-modal', false);{% endif %}
+    }
+});
+</script>
+
+{% endblock %}

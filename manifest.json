@@ -1,0 +1,27 @@
+{
+  "id": "dns-sync",
+  "name": "Local DNS Sync",
+  "version": "1.0.0",
+  "description": "Pushes DHCP names into Pi-hole or AdGuard Home local DNS so hostnames like nas.lan resolve without Kea DDNS — Jen only ever touches records it created itself (a ledger), and an Unbound export is offered for setups with no API.",
+  "author": "Matthew Thibodeau",
+  "requires_jen": "5.57.0",
+  "plugin_api": 3,
+  "tags": [
+    "dns",
+    "network",
+    "automation"
+  ],
+  "changelog_url": "https://github.com/ltkojak/jen-plugin-dns-sync/blob/main/CHANGELOG.md",
+  "nav": [
+    {
+      "section": "network",
+      "label": "DNS Sync",
+      "icon": "globe",
+      "endpoint": "dns_sync.index"
+    }
+  ],
+  "db_migrations": [
+    {"version": 1, "description": "ds_targets table", "sql": "CREATE TABLE IF NOT EXISTS ds_targets (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100) NOT NULL, kind ENUM('pihole','adguard') NOT NULL, url VARCHAR(255) NOT NULL, credential TEXT, domain VARCHAR(63) NOT NULL DEFAULT 'lan', sources SET('leases','reservations','ipam') NOT NULL DEFAULT 'leases,reservations', subnet_ids JSON NULL, allow_self_signed TINYINT(1) NOT NULL DEFAULT 0, enabled TINYINT(1) NOT NULL DEFAULT 0, previewed_at DATETIME NULL, last_sync_at DATETIME NULL, last_error VARCHAR(300) NULL, last_alert_at DATETIME NULL, created_by VARCHAR(100), created_at DATETIME DEFAULT CURRENT_TIMESTAMP)"},
+    {"version": 2, "description": "ds_records table (the ledger)", "sql": "CREATE TABLE IF NOT EXISTS ds_records (id INT AUTO_INCREMENT PRIMARY KEY, target_id INT NOT NULL, name VARCHAR(63) NOT NULL, ip VARCHAR(15) NOT NULL, source ENUM('lease','reservation','ipam') NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, UNIQUE KEY ux_target_name (target_id, name))"}
+  ]
+}

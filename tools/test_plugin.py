@@ -52,6 +52,39 @@ def load_plugin():
     return mod
 
 
+class _FakeApp:
+    def register_blueprint(self, bp):
+        pass
+
+
+def _stub_jen_plugin_api():
+    """A stub `jen`/`jen.plugin_api` sufficient for register(app) to run
+    end to end, with register_alert_type enforcing the SAME
+    '<plugin_id>_' prefix rule Jen's real one does (jen/services/alerts.py)
+    — this is what actually catches a mismatched type_id locally instead
+    of only in CI against a real app. Returns the list every
+    register_periodic() call is recorded into."""
+    periodic_calls = []
+
+    def register_alert_type(plugin_id, type_id, **kwargs):
+        prefix = f"{plugin_id}_"
+        if not type_id.startswith(prefix):
+            raise ValueError(f"type_id {type_id!r} must start with {prefix!r}")
+
+    def register_periodic(plugin_id, name, fn, every_minutes):
+        periodic_calls.append((plugin_id, name, fn, every_minutes))
+
+    jen_pkg = types.ModuleType("jen")
+    plugin_api = types.ModuleType("jen.plugin_api")
+    plugin_api.register_alert_type = register_alert_type
+    plugin_api.register_periodic = register_periodic
+    plugin_api.subscribe = lambda kind, fn: None
+    jen_pkg.plugin_api = plugin_api
+    sys.modules["jen"] = jen_pkg
+    sys.modules["jen.plugin_api"] = plugin_api
+    return periodic_calls
+
+
 failures = []
 
 
@@ -236,6 +269,26 @@ def main():
         check(gated, f"{fn.__name__} refuses a viewer before touching the request")
     p.current_user.role = "admin"
     check(p._is_admin() is True, "admin role restored for the rest of the run")
+
+    # ── register(): actually runs end to end against a stub jen.plugin_api ──
+    # (the real v1.0.1 bug: register_alert_type(PLUGIN_ID, "dns_sync_failed",
+    # ...) didn't start with "dns-sync_" — PLUGIN_ID has a hyphen, the type_id
+    # was all-underscore — and Jen's real register_alert_type raises on that
+    # mismatch, so the plugin never loaded at all; caught here by enforcing
+    # the same rule the stub's register_alert_type does)
+    periodic_calls = _stub_jen_plugin_api()
+    try:
+        p.register(_FakeApp())
+        registered = True
+    except Exception as e:
+        registered = False
+        print(f"      register() raised: {e}")
+    check(registered, "register(): runs end to end without raising against a real-rule stub")
+    tick_calls = [c for c in periodic_calls if c[1] == "reconcile"]
+    check(
+        len(tick_calls) == 1 and tick_calls[0][3] == 15,
+        f"register(): the reconcile tick is registered every 15 minutes (got {tick_calls})",
+    )
 
     if failures:
         print(f"\n{len(failures)} check(s) failed")

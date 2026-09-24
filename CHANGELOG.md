@@ -1,5 +1,24 @@
 # Local DNS Sync Plugin — Changelog
 
+## [1.0.1] - 2026-09-24
+
+### Fixed: the plugin could not load on any Jen install
+
+1.0.0's own alert type was registered as `dns_sync_failed` — an
+all-underscore name — but Jen requires a plugin's alert type id to
+start with the plugin's own id followed by an underscore, and this
+plugin's id is `dns-sync`, with a hyphen. `dns_sync_failed` doesn't
+start with `dns-sync_`, so `register_alert_type` raised on every
+single start, Jen's per-plugin error handling caught it and moved on,
+and Local DNS Sync never loaded: no nav item, no routes, no sync,
+ever, on any install. The alert type is now `dns-sync_failed`,
+matching the plugin's actual id; nothing else about it changes.
+
+`tools/test_plugin.py` now calls `register(app)` end to end against a
+stub that enforces the same id-prefix rule Jen's real
+`register_alert_type` does, so a mismatch like this is caught before
+it ever reaches a commit.
+
 ## [1.0.0] - 2026-09-24
 
 ### First release

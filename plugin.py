@@ -387,6 +387,12 @@ def _audit(action, target, detail):
 # ── Source queries (impure DB reads, filtered to a target's own subnet scope) ──
 
 
+def _in_placeholders(values):
+    """A `%s,%s,...` clause sized to `values`, for a dynamic `IN (...)` —
+    same helper shape as Jen's own add_subnet_restriction()."""
+    return ",".join(["%s"] * len(values))
+
+
 def _leases_for_subnets(subnet_ids):
     if not subnet_ids:
         return []
@@ -394,10 +400,10 @@ def _leases_for_subnets(subnet_ids):
     try:
         db = _get_kea_db()
         with db.cursor() as cur:
-            placeholders = ",".join(["%s"] * len(subnet_ids))
             cur.execute(
                 f"SELECT inet_ntoa(address) AS ip, hostname, subnet_id FROM lease4 "
-                f"WHERE state=0 AND hostname IS NOT NULL AND hostname != '' AND subnet_id IN ({placeholders})",
+                f"WHERE state=0 AND hostname IS NOT NULL AND hostname != '' "
+                f"AND subnet_id IN ({_in_placeholders(subnet_ids)})",
                 tuple(subnet_ids),
             )
             return cur.fetchall()
@@ -416,11 +422,10 @@ def _reservations_for_subnets(subnet_ids):
     try:
         db = _get_kea_db()
         with db.cursor() as cur:
-            placeholders = ",".join(["%s"] * len(subnet_ids))
             cur.execute(
                 f"SELECT inet_ntoa(ipv4_address) AS ip, hostname, dhcp4_subnet_id AS subnet_id FROM hosts "
                 f"WHERE ipv4_address IS NOT NULL AND ipv4_address > 0 AND hostname IS NOT NULL AND hostname != '' "
-                f"AND dhcp4_subnet_id IN ({placeholders})",
+                f"AND dhcp4_subnet_id IN ({_in_placeholders(subnet_ids)})",
                 tuple(subnet_ids),
             )
             return cur.fetchall()
@@ -439,11 +444,10 @@ def _ipam_for_subnets(subnet_ids):
     try:
         db = _get_db()
         with db.cursor() as cur:
-            placeholders = ",".join(["%s"] * len(subnet_ids))
             cur.execute(
                 f"SELECT ip, label AS hostname, subnet_id FROM ipam_static_entries "
                 f"WHERE subnet_kind='kea' AND entry_status IN ('static','planned') "
-                f"AND label IS NOT NULL AND label != '' AND subnet_id IN ({placeholders})",
+                f"AND label IS NOT NULL AND label != '' AND subnet_id IN ({_in_placeholders(subnet_ids)})",
                 tuple(subnet_ids),
             )
             return cur.fetchall()
@@ -771,9 +775,9 @@ def _maybe_alert(target, error_summary):
     try:
         from jen.plugin_api import send_alert
 
-        send_alert("dns_sync_failed", subnet_id=None, name=target["name"], kind=target["kind"], error=error_summary)
+        send_alert("dns-sync_failed", subnet_id=None, name=target["name"], kind=target["kind"], error=error_summary)
     except Exception as e:
-        logger.warning(f"DNS Sync: could not send dns_sync_failed alert: {e}")
+        logger.warning(f"DNS Sync: could not send dns-sync_failed alert: {e}")
 
 
 # ── Debounce glue (impure: threading.Timer, driven by the pure state above) ────
@@ -1118,7 +1122,7 @@ def register(app):
 
     register_alert_type(
         PLUGIN_ID,
-        "dns_sync_failed",
+        "dns-sync_failed",
         label="DNS Sync: sync failed",
         icon="triangle-alert",
         default_template="⚠️ DNS Sync target <b>{name}</b> ({kind}) failed: {error}",

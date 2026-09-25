@@ -2,12 +2,24 @@
 {% block title %}DNS Sync{% endblock %}
 {% block content %}
 
+<style>
+/* static declarations live here, not in inline style attributes (docs/ui.md); a plugin page has no
+   shared stylesheet hook, so the page carries its own block */
+.ds-card-flush{padding:0}
+.ds-modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:500;align-items:center;justify-content:center}
+.ds-dialog{overflow-y:auto}
+.ds-dialog-add{width:min(480px,94vw);max-height:90vh}
+.ds-dialog-preview{width:min(560px,94vw);max-height:85vh}
+.ds-dialog-records{width:min(480px,94vw);max-height:80vh}
+.ds-hidden{display:none}
+</style>
+
 <div class="page-header flex items-center between wrap gap-3">
     <div>
         <h1>{{ icon("globe", "ico-lg") }} DNS Sync</h1>
         <p>Pushes DHCP names into Pi-hole or AdGuard Home local DNS, so names like <span class="mono small">nas.lan</span> resolve without Kea DDNS.</p>
     </div>
-    {% if is_admin %}
+    {% if can_create %}
     <button id="ds-add-btn" class="btn btn-primary">{{ icon("plus") }} Add Target</button>
     {% endif %}
 </div>
@@ -16,7 +28,7 @@
 <div class="alert alert-info">{{ icon("info") }} DNS Sync tracks IPv4 addresses only.</div>
 {% endif %}
 
-<div class="card" style="padding:0;">
+<div class="card ds-card-flush">
 <div class="table-wrap">
 <table id="ds-table" class="rowlist">
     <thead><tr>
@@ -48,7 +60,7 @@
         <td data-m="trailing">
             <div class="flex gap-1 items-center">
                 <a class="btn btn-sm btn-secondary" title="Export Unbound local-data" aria-label="Export Unbound local-data" href="{{ url_for('dns_sync.export_unbound', target_id=r.id) }}">{{ icon("download") }}</a>
-                {% if is_admin %}
+                {% if is_admin and r.can_manage %}
                 <button class="btn btn-sm btn-secondary ds-preview-btn" title="Preview" aria-label="Preview" data-id="{{ r.id }}" data-name="{{ r.name }}">{{ icon("eye") }}</button>
                 <form method="POST" action="{{ url_for('dns_sync.toggle_target', target_id=r.id) }}" class="contents">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -56,6 +68,8 @@
                         {{ icon("timer") if r.enabled else icon("play") }}
                     </button>
                 </form>
+                {% endif %}
+                {% if can_create %}
                 <form method="POST" action="{{ url_for('dns_sync.delete_target', target_id=r.id) }}" class="contents"
                       data-confirm="Remove {{ r.name }}? Jen will not delete its records from the remote server.">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -67,16 +81,16 @@
     </tr>
     {% endfor %}
     {% if not rows %}
-    <tr><td data-m="full" colspan="6" class="center muted">No targets yet. {% if is_admin %}Add one above.{% endif %}</td></tr>
+    <tr><td data-m="full" colspan="6" class="center muted">No targets yet. {% if can_create %}Add one above.{% endif %}</td></tr>
     {% endif %}
     </tbody>
 </table>
 </div>
 </div>
 
-{% if is_admin %}
-<div id="ds-add-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:500;align-items:center;justify-content:center;">
-<div class="card" style="width:min(480px,94vw);max-height:90vh;overflow-y:auto;">
+{% if can_create %}
+<div id="ds-add-modal" class="ds-modal">
+<div class="card ds-dialog ds-dialog-add">
     <div class="flex between items-center mb-3">
         <h3>{{ icon("plus") }} Add Target</h3>
         <button id="ds-add-close-btn" class="btn btn-sm btn-secondary" aria-label="Close">{{ icon("x") }}</button>
@@ -122,7 +136,7 @@
         <div class="form-group">
             <label><input type="checkbox" name="scope_all" checked id="ds-scope-all"> All subnets I can access</label>
         </div>
-        <div class="form-group" id="ds-subnet-picker" style="display:none;">
+        <div class="form-group ds-hidden" id="ds-subnet-picker">
             <label>Subnets</label>
             {% for s in accessible_subnets %}
             <label class="flex items-center gap-1"><input type="checkbox" name="subnet_ids" value="{{ s.id }}"> {{ s.name }}</label>
@@ -137,8 +151,8 @@
 </div>
 {% endif %}
 
-<div id="ds-preview-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:500;align-items:center;justify-content:center;">
-<div class="card" style="width:min(560px,94vw);max-height:85vh;overflow-y:auto;">
+<div id="ds-preview-modal" class="ds-modal">
+<div class="card ds-dialog ds-dialog-preview">
     <div class="flex between items-center mb-3">
         <h3>{{ icon("eye") }} Preview — <span id="ds-preview-title"></span></h3>
         <button id="ds-preview-close-btn" class="btn btn-sm btn-secondary" aria-label="Close">{{ icon("x") }}</button>
@@ -147,8 +161,8 @@
 </div>
 </div>
 
-<div id="ds-records-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:500;align-items:center;justify-content:center;">
-<div class="card" style="width:min(480px,94vw);max-height:80vh;overflow-y:auto;">
+<div id="ds-records-modal" class="ds-modal">
+<div class="card ds-dialog ds-dialog-records">
     <div class="flex between items-center mb-3">
         <h3>{{ icon("globe") }} Records — <span id="ds-records-title"></span></h3>
         <button id="ds-records-close-btn" class="btn btn-sm btn-secondary" aria-label="Close">{{ icon("x") }}</button>
@@ -162,7 +176,7 @@ function _dsModal(id, show) {
     document.getElementById(id).style.display = show ? 'flex' : 'none';
 }
 
-{% if is_admin %}
+{% if can_create %}
 document.getElementById('ds-add-btn').addEventListener('click', function() { _dsModal('ds-add-modal', true); });
 document.getElementById('ds-add-close-btn').addEventListener('click', function() { _dsModal('ds-add-modal', false); });
 document.getElementById('ds-add-cancel-btn').addEventListener('click', function() { _dsModal('ds-add-modal', false); });
@@ -172,9 +186,11 @@ document.querySelector('select[name="kind"]').addEventListener('change', functio
     document.getElementById('ds-credential-label').textContent = this.value === 'adguard' ? 'Credentials' : 'Password';
 });
 document.getElementById('ds-scope-all').addEventListener('change', function() {
-    document.getElementById('ds-subnet-picker').style.display = this.checked ? 'none' : '';
+    document.getElementById('ds-subnet-picker').classList.toggle('ds-hidden', this.checked);
 });
+{% endif %}
 
+{% if is_admin %}
 document.querySelectorAll('.ds-preview-btn').forEach(function(btn) {
     btn.addEventListener('click', function() {
         var id = this.getAttribute('data-id');
@@ -187,7 +203,7 @@ document.querySelectorAll('.ds-preview-btn').forEach(function(btn) {
         var thisBtn = this;
         window.jenFetch('/network/dns-sync/targets/' + id + '/preview', {
             method: 'POST',
-            headers: {'X-CSRFToken': '{{ csrf_token() }}'}
+            headers: {'X-CSRFToken': {{ csrf_token() | tojson }}}
         })
             .then(function(r) { return r.json(); })
             .then(function(d) {
@@ -254,7 +270,7 @@ document.addEventListener('keydown', function(e) {
     if (e.key === 'Escape') {
         _dsModal('ds-records-modal', false);
         _dsModal('ds-preview-modal', false);
-        {% if is_admin %}_dsModal('ds-add-modal', false);{% endif %}
+        {% if can_create %}_dsModal('ds-add-modal', false);{% endif %}
     }
 });
 </script>

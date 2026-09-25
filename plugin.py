@@ -36,6 +36,10 @@ JS app the doc-reading tool can't execute): github.com/pi-hole/FTL,
     body ("Add config array item"). `DELETE` the same path -> 204.
     There is no per-item update; Pi-hole hosts lines are changed by
     deleting the old string and adding the new one.
+  * `DELETE {url}/api/auth` (same `X-FTL-SID` header) -> 204 "delete the
+    current session" (404 when none is active) — `auth.yaml`, re-read
+    2026-09-25 for 1.0.2. A sync opens ONE session and logs it out at
+    the end instead of leaving one per call to expire on its own.
 
 AdGuard Home — `openapi/openapi.yaml` @ master, github.com/
 AdguardTeam/AdGuardHome, 2026-09-24. `servers: [{url: /control}]`,
@@ -72,6 +76,12 @@ only later, from inside a real `subscribe()` callback on Jen's already-
 running event dispatcher, so this never fights `create_app()`'s "starts
 nothing" rule the way a raw always-on loop would.
 
+**Who may do what (1.0.2).** A target is an ALL-KNOWN object: acting on it needs every
+subnet it lists (`target_manageable`), creating or deleting one needs an account that can
+see every subnet, and only seeing it and its records is scoped (`target_visible` and a
+per-record filter by where each address lives). Every by-id route judges the target's own
+subnets, never a value the caller typed.
+
 **Mandatory preview.** A target is created `enabled=0`. The Preview
 action runs the planner without applying anything and stamps
 `previewed_at`; the Enable toggle refuses (flash, no state change) when
@@ -79,6 +89,7 @@ action runs the planner without applying anything and stamps
 operator having seen what it would do first.
 """
 
+import contextlib
 import ipaddress
 import json
 import logging
@@ -301,6 +312,87 @@ def resolve_subnet_ids(selected, accessible):
     return sorted(set(selected) & set(accessible))
 
 
+def normalize_domain(raw):
+    """Pure: the domain suffix a target appends to every name -> (domain,
+    None) | (None, reason). Blank means the default `lan`. Every dot-separated
+    part must be a DNS label (the same rule host labels obey) and the whole
+    thing must fit `ds_targets.domain` (VARCHAR(63)); the old code cut the
+    text at 63 characters and stored whatever was left, so `lan; rm -rf` or
+    `a..b` went straight into a record name and an AdGuard rewrite."""
+    s = (raw or "").strip().lower().strip(".")
+    if not s:
+        return "lan", None
+    if len(s) > 63:
+        return None, "the domain suffix is longer than 63 characters"
+    for label in s.split("."):
+        if not _LABEL_RE.match(label):
+            return None, f"{raw!r} is not a valid domain suffix (letters, digits and hyphens, dot-separated)"
+    return s, None
+
+
+def target_visible(subnet_ids, can):
+    """Pure: may this caller SEE that a target exists and read its records?
+    `can(subnet_id)` is the caller's own subnet predicate, `can(None)` is True
+    only for an unrestricted caller. Any one accessible subnet is enough to see
+    the target; the record list is still filtered row by row."""
+    if can(None):
+        return True
+    return any(can(sid) for sid in subnet_ids)
+
+
+def target_manageable(subnet_ids, can):
+    """Pure: may this caller ACT on the target (preview, enable, pause)? A DNS
+    Sync target is an all-known object: it pushes the names of EVERY subnet it
+    lists, so acting on it needs every one of them. A target that lists no
+    subnet at all is the unrestricted caller's."""
+    if not subnet_ids:
+        return bool(can(None))
+    return all(can(sid) for sid in subnet_ids)
+
+
+def apply_plan(plan, ledger, source_by_name, add_fn, remove_fn):
+    """Impure only through the two callables. Carries out `plan_sync`'s plan and
+    reports what was DELIVERED: `(upserts [(name, ip, source)], removes [name],
+    errors [str])`.
+
+    An update is a removal of the record the ledger holds (the old IP) followed
+    by the add of the new one. Pi-hole keeps every `"ip name"` line it is given
+    and AdGuard every rewrite, so adding alone left the stale record answering
+    next to the new one, and the ledger — by then holding the new IP — could
+    never clean it. If the removal fails the add is NOT attempted (the ledger
+    still says what is on the server); if the removal succeeded and the add
+    failed, the name is reported removed so the ledger row goes and the next
+    sync retries a plain add."""
+    upserts, removes, errors = [], [], []
+    for name, ip in plan["add"]:
+        try:
+            add_fn(name, ip)
+            upserts.append((name, ip, source_by_name.get(name, "lease")))
+        except _SyncError as e:
+            errors.append(f"{name}: {e}")
+    for name, ip in plan["update"]:
+        old_ip = ledger.get(name)
+        if old_ip and old_ip != ip:
+            try:
+                remove_fn(name, old_ip)
+                removes.append(name)
+            except _SyncError as e:
+                errors.append(f"{name}: {e}")
+                continue
+        try:
+            add_fn(name, ip)
+            upserts.append((name, ip, source_by_name.get(name, "lease")))
+        except _SyncError as e:
+            errors.append(f"{name}: {e}")
+    for name in plan["remove"]:
+        try:
+            remove_fn(name, ledger.get(name))
+            removes.append(name)
+        except _SyncError as e:
+            errors.append(f"{name}: {e}")
+    return upserts, removes, errors
+
+
 # ── DB helpers (same shape as every other bundled plugin) ──────────────────────
 
 
@@ -347,8 +439,25 @@ def _require_write():
     return False
 
 
+def _can(subnet_id):
+    """The session user's subnet predicate — `plugin_api.can_access_subnet`, so
+    `_can(None)` is True only for an unrestricted user (v5.65.2). Kept as one
+    function so the tests and the pure helpers above take it as a parameter."""
+    from jen.plugin_api import can_access_subnet
+
+    return can_access_subnet(subnet_id)
+
+
 def _all_subnets_user():
-    return bool(getattr(current_user, "all_subnets", False))
+    return _can(None)
+
+
+def _target_subnets(target):
+    raw = target.get("subnet_ids") or "[]"
+    try:
+        return [int(v) for v in (json.loads(raw) if isinstance(raw, str) else raw)]
+    except (TypeError, ValueError):
+        return []
 
 
 def _derive_subnet_id(ip, subnet_map):
@@ -365,14 +474,6 @@ def _derive_subnet_id(ip, subnet_map):
         except ValueError:
             continue
     return None
-
-
-def _target_visible(target_subnet_ids, accessible, all_subnets):
-    if all_subnets:
-        return True
-    if not target_subnet_ids:
-        return False
-    return bool(set(target_subnet_ids) & set(accessible))
 
 
 def _audit(action, target, detail):
@@ -401,7 +502,7 @@ def _leases_for_subnets(subnet_ids):
         db = _get_kea_db()
         with db.cursor() as cur:
             cur.execute(
-                f"SELECT inet_ntoa(address) AS ip, hostname, subnet_id FROM lease4 "
+                f"SELECT inet_ntoa(address) AS ip, hostname, subnet_id FROM lease4 "  # nosec B608 - only `%s` placeholders are interpolated; every value is bound
                 f"WHERE state=0 AND hostname IS NOT NULL AND hostname != '' "
                 f"AND subnet_id IN ({_in_placeholders(subnet_ids)})",
                 tuple(subnet_ids),
@@ -423,7 +524,7 @@ def _reservations_for_subnets(subnet_ids):
         db = _get_kea_db()
         with db.cursor() as cur:
             cur.execute(
-                f"SELECT inet_ntoa(ipv4_address) AS ip, hostname, dhcp4_subnet_id AS subnet_id FROM hosts "
+                f"SELECT inet_ntoa(ipv4_address) AS ip, hostname, dhcp4_subnet_id AS subnet_id FROM hosts "  # nosec B608 - only `%s` placeholders are interpolated; every value is bound
                 f"WHERE ipv4_address IS NOT NULL AND ipv4_address > 0 AND hostname IS NOT NULL AND hostname != '' "
                 f"AND dhcp4_subnet_id IN ({_in_placeholders(subnet_ids)})",
                 tuple(subnet_ids),
@@ -445,7 +546,7 @@ def _ipam_for_subnets(subnet_ids):
         db = _get_db()
         with db.cursor() as cur:
             cur.execute(
-                f"SELECT ip, label AS hostname, subnet_id FROM ipam_static_entries "
+                f"SELECT ip, label AS hostname, subnet_id FROM ipam_static_entries "  # nosec B608 - only `%s` placeholders are interpolated; every value is bound
                 f"WHERE subnet_kind='kea' AND entry_status IN ('static','planned') "
                 f"AND label IS NOT NULL AND label != '' AND subnet_id IN ({_in_placeholders(subnet_ids)})",
                 tuple(subnet_ids),
@@ -544,8 +645,39 @@ def _pihole_sid(target):
     return session.get("sid")
 
 
-def _pihole_fetch_remote(target):
-    sid = _pihole_sid(target)
+def _pihole_logout(target, sid):
+    """Best effort: end the session this sync opened (`DELETE /api/auth`). A
+    failure is only logged — the session expires by itself in 30 minutes."""
+    if not sid:
+        return
+    try:
+        _http_call(
+            "DELETE",
+            f"{target['url']}/api/auth",
+            headers={"X-FTL-SID": sid},
+            allow_self_signed=bool(target.get("allow_self_signed")),
+        )
+    except _SyncError as e:
+        logger.debug(f"DNS Sync: Pi-hole logout failed: {e}")
+
+
+@contextlib.contextmanager
+def _remote_session(target):
+    """One authenticated session per sync or preview: yields the Pi-hole `sid`
+    (None for AdGuard Home, whose auth is per-request Basic, and for a Pi-hole
+    with no password set) and logs it out on the way out. Before 1.0.2 every
+    `_pihole_fetch_remote` opened its own and nothing ever closed one — Pi-hole
+    caps concurrent sessions, so a busy target could lock the operator out of
+    their own web interface."""
+    sid = _pihole_sid(target) if target["kind"] == "pihole" else None
+    try:
+        yield sid
+    finally:
+        if target["kind"] == "pihole":
+            _pihole_logout(target, sid)
+
+
+def _pihole_fetch_remote(target, sid):
     headers = {"X-FTL-SID": sid} if sid else {}
     status, parsed = _http_call(
         "GET",
@@ -625,9 +757,9 @@ def _adguard_apply(target, action, ip, name):
         raise _SyncError(f"AdGuard Home {action} {name} failed (HTTP {status})")
 
 
-def _fetch_remote(target):
+def _fetch_remote(target, sid=None):
     if target["kind"] == "pihole":
-        return _pihole_fetch_remote(target)
+        return _pihole_fetch_remote(target, sid)
     return _adguard_fetch_remote(target)
 
 
@@ -648,24 +780,48 @@ def _apply_remove(target, sid, name, ip):
 # ── Sync orchestration (impure: DB + network; the pure planner does the thinking) ──
 
 
-def _plan_for_target(target):
+def _plan_for_target(target, sid=None, session_error=None):
     """(plan, desired, source_by_name, ledger, skipped, remote_error).
-    Fetches the remote list best-effort — a remote fetch failure still
-    returns a plan (add-only, since `remote` degrades to {}), so
-    Preview and a real sync degrade the same way rather than blocking
-    entirely."""
+    Fetches the remote list once, on the caller's session. A fetch failure
+    still returns a plan (add-only, `remote` degrades to {}) so PREVIEW can show
+    the operator something and say why; a real sync must not act on it —
+    `_sync_one_target` aborts when `remote_error` is set."""
     desired, source_by_name, skipped = _desired_for_target(target)
     ledger, _rows = _ledger_for_target(target["id"])
-    remote, remote_error = {}, None
-    try:
-        remote = _fetch_remote(target)
-    except _SyncError as e:
-        remote_error = str(e)
+    remote, remote_error = {}, session_error
+    if session_error is None:
+        try:
+            remote = _fetch_remote(target, sid)
+        except _SyncError as e:
+            remote_error = str(e)
     plan = plan_sync(desired, ledger, remote)
     return plan, desired, source_by_name, ledger, skipped, remote_error
 
 
+# One lock per target: the debounced sync and the 15-minute reconcile both call
+# `_sync_one_target`, and two runs against one target would each plan from the
+# same ledger and then apply overlapping changes.
+_target_locks: dict[int, threading.Lock] = {}
+_target_locks_guard = threading.Lock()
+
+
+def _lock_for(target_id):
+    with _target_locks_guard:
+        return _target_locks.setdefault(target_id, threading.Lock())
+
+
 def _sync_one_target(target_id):
+    lock = _lock_for(target_id)
+    if not lock.acquire(blocking=False):
+        logger.info(f"DNS Sync: target {target_id} is already syncing; skipping this run")
+        return
+    try:
+        _sync_locked(target_id)
+    finally:
+        lock.release()
+
+
+def _sync_locked(target_id):
     db = None
     try:
         db = _get_db()
@@ -678,36 +834,30 @@ def _sync_one_target(target_id):
     if not target or not target["enabled"] or not target["previewed_at"]:
         return
 
-    plan, _desired, source_by_name, ledger, _skipped, remote_error = _plan_for_target(target)
-    sid = None
-    errors = []
-    if target["kind"] == "pihole" and (plan["add"] or plan["update"] or plan["remove"]):
-        try:
-            sid = _pihole_sid(target)
-        except _SyncError as e:
-            errors.append(str(e))
+    try:
+        with _remote_session(target) as sid:
+            plan, _desired, source_by_name, ledger, _skipped, remote_error = _plan_for_target(target, sid)
+            if remote_error:
+                # The remote list is what tells a drifted record from a missing one; without it
+                # every record would still cost its own 10 s call. Stop and say so.
+                _record_sync_result(target_id, remote_error)
+                _maybe_alert(target, remote_error)
+                return
+            upserts, removes, errors = apply_plan(
+                plan,
+                ledger,
+                source_by_name,
+                lambda name, ip: _apply_add(target, sid, name, ip),
+                lambda name, ip: _apply_remove(target, sid, name, ip),
+            )
+    except _SyncError as e:
+        _record_sync_result(target_id, str(e))
+        _maybe_alert(target, str(e))
+        return
 
-    applied_upsert = []
-    applied_remove = []
-    if not errors:
-        for name, ip in plan["add"] + plan["update"]:
-            try:
-                _apply_add(target, sid, name, ip)
-                applied_upsert.append((name, ip, source_by_name.get(name, "lease")))
-            except _SyncError as e:
-                errors.append(f"{name}: {e}")
-        for name in plan["remove"]:
-            old_ip = ledger.get(name)
-            try:
-                _apply_remove(target, sid, name, old_ip)
-                applied_remove.append(name)
-            except _SyncError as e:
-                errors.append(f"{name}: {e}")
+    _update_ledger(target_id, upserts, removes)
 
-    _update_ledger(target_id, applied_upsert, applied_remove)
-
-    summary = "; ".join(errors[:5]) if errors else (remote_error or "")
-    _record_sync_result(target_id, summary)
+    _record_sync_result(target_id, "; ".join(errors[:5]))
     if errors:
         _maybe_alert(target, "; ".join(errors[:3]))
 
@@ -723,14 +873,16 @@ def _update_ledger(target_id, applied_upsert, applied_remove):
     try:
         db = _get_db()
         with db.cursor() as cur:
+            # removals first: an UPDATE is a removal of the old record followed by an add of the
+            # new one, so the same name is in both lists and the row must end up holding the new IP
+            for name in applied_remove:
+                cur.execute("DELETE FROM ds_records WHERE target_id=%s AND name=%s", (target_id, name))
             for name, ip, source in applied_upsert:
                 cur.execute(
                     "INSERT INTO ds_records (target_id, name, ip, source) VALUES (%s, %s, %s, %s) "
                     "ON DUPLICATE KEY UPDATE ip=VALUES(ip), source=VALUES(source)",
                     (target_id, name, ip, source),
                 )
-            for name in applied_remove:
-                cur.execute("DELETE FROM ds_records WHERE target_id=%s AND name=%s", (target_id, name))
         db.commit()
     except Exception as e:
         logger.error(f"DNS Sync: ledger update failed: {e}")
@@ -876,9 +1028,6 @@ def _target_rows():
                 "previewed_at, last_sync_at, last_error, created_by FROM ds_targets ORDER BY name"
             )
             rows = cur.fetchall()
-            for r in rows:
-                cur.execute("SELECT COUNT(*) AS n FROM ds_records WHERE target_id=%s", (r["id"],))
-                r["record_count"] = cur.fetchone()["n"]
     except Exception as e:
         logger.error(f"DNS Sync: index error: {e}")
         rows = []
@@ -888,23 +1037,61 @@ def _target_rows():
     return rows
 
 
+def _load_target(target_id):
+    """The whole ds_targets row, or None."""
+    db = None
+    try:
+        db = _get_db()
+        with db.cursor() as cur:
+            cur.execute("SELECT * FROM ds_targets WHERE id=%s", (target_id,))
+            return cur.fetchone()
+    finally:
+        if db:
+            db.close()
+
+
+def _visible_records(target_id):
+    """The ledger rows of a target that the session user may see. A record's subnet is where
+    its IP actually lives; one that lives in no known subnet belongs to unrestricted users only."""
+    subnet_map = _subnet_map()
+    _ledger, rows = _ledger_for_target(target_id)
+    return [r for r in rows if _can(_derive_subnet_id(r["ip"], subnet_map))]
+
+
+def _reachable_target(target_id):
+    """The target when the caller may see it at all, else None — the same answer for a
+    target that does not exist and one in subnets the caller has no access to."""
+    target = _load_target(target_id)
+    if target is None or not target_visible(_target_subnets(target), _can):
+        return None
+    return target
+
+
 @bp.route("/")
 @login_required
 def index():
+    rows = []
+    for r in _target_rows():
+        ids = _target_subnets(r)
+        if not target_visible(ids, _can):
+            continue
+        r["can_manage"] = target_manageable(ids, _can)
+        r["record_count"] = len(_visible_records(r["id"]))
+        rows.append(r)
     accessible = _accessible_subnets()
-    all_subnets = _all_subnets_user()
-    rows = [r for r in _target_rows() if _target_visible(json.loads(r["subnet_ids"] or "[]"), accessible, all_subnets)]
     subnet_map = _subnet_map()
     accessible_subnets = [
         {"id": sid, "name": subnet_map.get(sid, {}).get("name") or f"subnet {sid}"} for sid in sorted(accessible)
     ]
+    admin = _is_admin()
     return render_template(
         "dns_sync/index.html",
         rows=rows,
         kinds=_KINDS,
         sources=_SOURCES,
         accessible_subnets=accessible_subnets,
-        is_admin=_is_admin(),
+        is_admin=admin,
+        can_create=admin and _all_subnets_user(),
     )
 
 
@@ -912,6 +1099,11 @@ def index():
 @login_required
 def add_target():
     if not _require_write():
+        return redirect(url_for("dns_sync.index"))
+    if not _all_subnets_user():
+        # A target holds the DNS server's credential and applies to a whole set of subnets, so it is
+        # global integration configuration: only an account that can see every subnet may create one.
+        flash("Adding a DNS Sync target needs an account that can see every subnet.", "error")
         return redirect(url_for("dns_sync.index"))
 
     name = request.form.get("name", "").strip()[:100]
@@ -923,7 +1115,10 @@ def add_target():
     if not url.startswith(("http://", "https://")):
         flash("URL must start with http:// or https://.", "error")
         return redirect(url_for("dns_sync.index"))
-    domain = request.form.get("domain", "lan").strip().lower()[:63] or "lan"
+    domain, domain_error = normalize_domain(request.form.get("domain", "lan"))
+    if domain is None:
+        flash(domain_error, "error")
+        return redirect(url_for("dns_sync.index"))
     selected_sources = set(request.form.getlist("sources")) & set(_SOURCES)
     if not selected_sources:
         flash("Pick at least one source.", "error")
@@ -983,19 +1178,21 @@ def add_target():
 def preview_target(target_id):
     if not _require_write():
         return jsonify({"error": "forbidden"}), 403
-    db = None
-    try:
-        db = _get_db()
-        with db.cursor() as cur:
-            cur.execute("SELECT * FROM ds_targets WHERE id=%s", (target_id,))
-            target = cur.fetchone()
-    finally:
-        if db:
-            db.close()
+    target = _reachable_target(target_id)
     if not target:
         return jsonify({"error": "not found"}), 404
+    if not target_manageable(_target_subnets(target), _can):
+        # Preview stamps `previewed_at`, which is what lets the target be enabled, so it is a write:
+        # it needs the same every-subnet access enabling does.
+        return jsonify({"error": "this target covers subnets you cannot access"}), 403
 
-    plan, _desired, _source_by_name, _ledger, skipped, remote_error = _plan_for_target(target)
+    try:
+        with _remote_session(target) as sid:
+            plan, _desired, _source_by_name, _ledger, skipped, remote_error = _plan_for_target(target, sid)
+    except _SyncError as e:
+        plan, _desired, _source_by_name, _ledger, skipped, remote_error = _plan_for_target(
+            target, None, session_error=str(e)
+        )
 
     db = None
     try:
@@ -1025,19 +1222,21 @@ def preview_target(target_id):
 def toggle_target(target_id):
     if not _require_write():
         return redirect(url_for("dns_sync.index"))
+    row = _reachable_target(target_id)
+    if row is None:
+        flash("Target not found.", "error")
+        return redirect(url_for("dns_sync.index"))
+    if not target_manageable(_target_subnets(row), _can):
+        flash("That target covers subnets you cannot access, so you cannot change it.", "error")
+        return redirect(url_for("dns_sync.index"))
+    if not row["enabled"] and not row["previewed_at"]:
+        flash("Run Preview before enabling a target for the first time.", "error")
+        return redirect(url_for("dns_sync.index"))
+    new_enabled = 0 if row["enabled"] else 1
     db = None
     try:
         db = _get_db()
         with db.cursor() as cur:
-            cur.execute("SELECT enabled, previewed_at FROM ds_targets WHERE id=%s", (target_id,))
-            row = cur.fetchone()
-            if row is None:
-                flash("Target not found.", "error")
-                return redirect(url_for("dns_sync.index"))
-            if not row["enabled"] and not row["previewed_at"]:
-                flash("Run Preview before enabling a target for the first time.", "error")
-                return redirect(url_for("dns_sync.index"))
-            new_enabled = 0 if row["enabled"] else 1
             cur.execute("UPDATE ds_targets SET enabled=%s WHERE id=%s", (new_enabled, target_id))
         db.commit()
         flash("Target enabled." if new_enabled else "Target paused.", "success")
@@ -1055,6 +1254,12 @@ def toggle_target(target_id):
 @login_required
 def delete_target(target_id):
     if not _require_write():
+        return redirect(url_for("dns_sync.index"))
+    if not _all_subnets_user():
+        flash("Removing a DNS Sync target needs an account that can see every subnet.", "error")
+        return redirect(url_for("dns_sync.index"))
+    if _load_target(target_id) is None:
+        flash("Target not found.", "error")
         return redirect(url_for("dns_sync.index"))
     db = None
     try:
@@ -1076,38 +1281,22 @@ def delete_target(target_id):
 @bp.route("/targets/<int:target_id>/records")
 @login_required
 def target_records(target_id):
-    accessible = _accessible_subnets()
-    all_subnets = _all_subnets_user()
-    subnet_map = _subnet_map()
-    _ledger, rows = _ledger_for_target(target_id)
-    out = []
-    for r in rows:
-        sid = _derive_subnet_id(r["ip"], subnet_map)
-        if sid is not None and sid not in accessible and not all_subnets:
-            continue
-        if sid is None and not all_subnets:
-            continue
-        out.append({"name": r["name"], "ip": r["ip"], "source": r["source"]})
-    return jsonify({"rows": out})
+    if _reachable_target(target_id) is None:
+        return jsonify({"error": "not found"}), 404
+    rows = [{"name": r["name"], "ip": r["ip"], "source": r["source"]} for r in _visible_records(target_id)]
+    return jsonify({"rows": rows})
 
 
 @bp.route("/targets/<int:target_id>/export-unbound")
 @login_required
 def export_unbound(target_id):
-    db = None
-    try:
-        db = _get_db()
-        with db.cursor() as cur:
-            cur.execute("SELECT domain FROM ds_targets WHERE id=%s", (target_id,))
-            target = cur.fetchone()
-    finally:
-        if db:
-            db.close()
-    if not target:
-        flash("Target not found.", "error")
-        return redirect(url_for("dns_sync.index"))
-    ledger, _rows = _ledger_for_target(target_id)
-    body = unbound_export(ledger, target["domain"])
+    target = _reachable_target(target_id)
+    if target is None:
+        return Response("Target not found.", status=404, mimetype="text/plain")
+    # The same per-record filter the record list applies: an export of the whole ledger would hand
+    # a subnet-restricted user the names and addresses of hosts in subnets they cannot see.
+    records = {r["name"]: r["ip"] for r in _visible_records(target_id)}
+    body = unbound_export(records, target["domain"])
     return Response(
         body,
         mimetype="text/plain",

@@ -1,5 +1,88 @@
 # Local DNS Sync Plugin — Changelog
 
+## [1.0.2] - 2026-09-25
+
+Requires Jen 5.65.2 or later (the `can_access_subnet` helper in the plugin API).
+
+### Fixed: an IP change left the old record answering
+
+Changing a host's address planned an "update", and the applier handled an
+update by adding the new record only. Pi-hole keeps every `"ip name"` line
+it is given and AdGuard Home keeps every rewrite, so both servers ended up
+with the old and the new address for the same name — and because the
+ledger by then held the new address, nothing could ever clean the old one
+up. An update is now what the module documentation always said it was: the
+record the ledger holds is removed, then the new one is added. If the
+removal fails the add is not attempted (the remote is unchanged and the
+ledger still says so); if the removal worked and the add failed, the ledger
+row is dropped so the next run is a plain add. A record Jen did not create is
+still never touched.
+
+### Fixed: routes authorised one thing and acted on another
+
+A subnet-restricted user could preview, enable, pause or delete a target by
+its id, and download its whole ledger as an Unbound file, whatever subnets
+the target covered. Preview mattered most: it returned the names and
+addresses of hosts in subnets the caller could not see, and stamped the
+timestamp that lets a target be enabled. The bug shape this release names in every plugin: the route checked one thing (nothing, for a by-id
+POST) and acted on another (a target that pushes subnets the caller has no
+access to).
+
+A DNS Sync target is now treated as an all-known object. Acting on it
+(preview, enable, pause) needs access to **every** subnet it covers;
+creating and deleting one — it holds the DNS server's credential and applies
+to a set of subnets — is for accounts that can see every subnet; a target
+that lists no subnet is likewise for those accounts alone. Only *seeing* a
+target and its records stays scoped: one accessible subnet is enough to see
+that a target exists, and the record list and the Unbound export are filtered
+record by record, by where each address actually lives (an address in no known
+subnet is for unrestricted accounts only). A target you cannot see is
+answered exactly as one that does not exist. The page hides the buttons a
+caller could not use.
+
+### Fixed: a failed fetch of the remote list did not stop the sync
+
+When reading the DNS server's current records failed, the sync carried on
+with an empty picture and made one 10-second call per record, each of them
+failing the same way. It now stops at the first failure, records the error
+on the target and raises the usual alert. Preview still shows what it can
+and says why the remote list was unavailable.
+
+### Fixed: Pi-hole sessions were never closed
+
+Every read of a Pi-hole opened a fresh session and nothing ever closed one;
+Pi-hole caps concurrent sessions, so a busy target could lock the operator
+out of their own web interface until the sessions timed out. A sync or a
+preview now opens one session, uses it for every call and ends it with
+`DELETE /api/auth`.
+
+### Fixed: two syncs of one target could overlap
+
+The debounced, event-driven sync and the 15-minute reconcile both plan from the
+ledger, so two runs at once could apply overlapping changes. A run now takes a
+per-target lock and skips itself when the target is already syncing.
+
+### Fixed: the domain suffix was cut, not checked
+
+The suffix was truncated to 63 characters and stored as typed, so a value like
+`a..b` or one with a space went straight into every record name and AdGuard
+rewrite. It must now be dot-separated DNS labels that fit the column, or the
+target is not saved.
+
+### Changed
+
+- The CSRF token in the page's script is emitted with `|tojson`, not pasted
+  between quotes.
+- The page's static styling moved out of inline `style=` attributes into the
+  page's own `<style>` block; `tools/verify.py` now fails a template that
+  carries one.
+- The three dynamic `IN (...)` builders carry a one-line `# nosec B608` saying
+  why they are safe (only `%s` placeholders are interpolated).
+- `tools/test_plugin.py` calls the real applier, session, lock and route
+  functions against fakes: an IP change ends with exactly one record on the
+  remote, a failed fetch makes no per-record call, a restricted caller is
+  refused on every by-id route.
+
 ## [1.0.1] - 2026-09-24
 
 ### Fixed: the plugin could not load on any Jen install

@@ -79,6 +79,7 @@ def _stub_jen_plugin_api():
     plugin_api.register_alert_type = register_alert_type
     plugin_api.register_periodic = register_periodic
     plugin_api.subscribe = lambda kind, fn: None
+    plugin_api.can_access_subnet = lambda subnet_id, *, allow_unattributed=False: True
     jen_pkg.plugin_api = plugin_api
     sys.modules["jen"] = jen_pkg
     sys.modules["jen.plugin_api"] = plugin_api
@@ -269,6 +270,295 @@ def main():
         check(gated, f"{fn.__name__} refuses a viewer before touching the request")
     p.current_user.role = "admin"
     check(p._is_admin() is True, "admin role restored for the rest of the run")
+
+    # ── 1.0.2: the domain suffix is validated as DNS labels ──────────────────
+    check(p.normalize_domain("") == ("lan", None), "normalize_domain: blank is the default `lan`")
+    check(
+        p.normalize_domain("  Home.Example.  ") == ("home.example", None), "normalize_domain: lower-cased, dots trimmed"
+    )
+    for bad in ("a..b", "lan; rm -rf", "-lan", "a b", "x" * 64, "ok." + "y" * 64):
+        dom, reason = p.normalize_domain(bad)
+        check(dom is None and reason, f"normalize_domain: {bad[:20]!r} is refused with a reason")
+    check(p.normalize_domain("a" * 63)[0] == "a" * 63, "normalize_domain: 63 characters still fits the column")
+
+    # ── 1.0.2: the two subnet predicates a target is judged by ────────────────
+    only_one = lambda sid: sid == 1  # noqa: E731 - a subnet-restricted caller: subnet 1 only, None is not theirs
+    everything = lambda sid: True  # noqa: E731 - an unrestricted caller
+    check(
+        p.target_visible([1, 2, 3], only_one) is True, "target_visible: ONE accessible subnet is enough to see a target"
+    )
+    check(p.target_visible([2, 3], only_one) is False, "target_visible: a target in no accessible subnet is invisible")
+    check(
+        p.target_visible([], only_one) is False, "target_visible: a target with no subnet is not a restricted caller's"
+    )
+    check(p.target_visible([], everything) is True, "target_visible: an unrestricted caller sees every target")
+    check(
+        p.target_manageable([1, 2, 3], only_one) is False, "target_manageable: needs EVERY subnet, not an intersection"
+    )
+    check(p.target_manageable([1], only_one) is True, "target_manageable: a target wholly inside the caller's subnets")
+    check(p.target_manageable([], only_one) is False, "target_manageable: a target with no subnet is unrestricted-only")
+    check(
+        p.target_manageable([], everything) is True, "target_manageable: an unrestricted caller manages an empty scope"
+    )
+
+    # ── 1.0.2: an update REMOVES the stale record, then adds ─────────────────
+    class Remote:
+        """Pi-hole/AdGuard in miniature: a SET of (name, ip) lines — it keeps whatever it is given."""
+
+        def __init__(self, lines):
+            self.lines = set(lines)
+            self.fail_remove = set()
+            self.fail_add = set()
+
+        def add(self, name, ip):
+            if name in self.fail_add:
+                raise p._SyncError("add refused")
+            self.lines.add((name, ip))
+
+        def remove(self, name, ip):
+            if name in self.fail_remove:
+                raise p._SyncError("remove refused")
+            self.lines.discard((name, ip))
+
+    remote = Remote({("nas", "10.0.0.5"), ("foreign", "10.0.0.77")})
+    ledger = {"nas": "10.0.0.5"}
+    plan = p.plan_sync({"nas": "10.0.0.6"}, ledger, {"nas": "10.0.0.5", "foreign": "10.0.0.77"})
+    ups, rems, errs = p.apply_plan(plan, ledger, {"nas": "reservation"}, remote.add, remote.remove)
+    check(
+        remote.lines == {("nas", "10.0.0.6"), ("foreign", "10.0.0.77")},
+        f"apply_plan: after an IP change the remote holds exactly ONE nas record and the foreign one is untouched (got {remote.lines})",
+    )
+    check(
+        ups == [("nas", "10.0.0.6", "reservation")] and rems == ["nas"] and not errs,
+        "apply_plan: reports the removal and the add",
+    )
+
+    remote = Remote({("nas", "10.0.0.5")})
+    remote.fail_remove = {"nas"}
+    ups, rems, errs = p.apply_plan(plan, ledger, {}, remote.add, remote.remove)
+    check(
+        remote.lines == {("nas", "10.0.0.5")},
+        "apply_plan: a failed removal leaves the remote as it was — no second record is added",
+    )
+    check(not ups and not rems and len(errs) == 1, "apply_plan: a failed removal reports an error and delivers nothing")
+
+    remote = Remote({("nas", "10.0.0.5")})
+    remote.fail_add = {"nas"}
+    ups, rems, errs = p.apply_plan(plan, ledger, {}, remote.add, remote.remove)
+    check(
+        not ups and rems == ["nas"] and len(errs) == 1,
+        "apply_plan: removed but not added -> reported removed so the ledger row goes and the next sync is a plain add",
+    )
+
+    remote = Remote({("old", "10.0.0.1"), ("foreign", "10.0.0.9")})
+    plan = p.plan_sync({}, {"old": "10.0.0.1"}, {"old": "10.0.0.1", "foreign": "10.0.0.9"})
+    ups, rems, errs = p.apply_plan(plan, {"old": "10.0.0.1"}, {}, remote.add, remote.remove)
+    check(
+        remote.lines == {("foreign", "10.0.0.9")} and rems == ["old"],
+        "apply_plan: a plain removal still removes only the ledger's record",
+    )
+
+    # ── a fake database, to see what the impure functions actually do ────────
+    class FakeDB:
+        def __init__(self, selects=None):
+            self.statements = []
+            self.selects = list(selects or [])
+            self.committed = False
+
+        def cursor(self):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params=()):
+            self.statements.append((sql.split()[0].upper(), sql, params))
+
+        def fetchone(self):
+            return self.selects.pop(0) if self.selects else None
+
+        def fetchall(self):
+            return self.selects.pop(0) if self.selects else []
+
+        def commit(self):
+            self.committed = True
+
+        def close(self):
+            pass
+
+    fdb = FakeDB()
+    p._get_db = lambda: fdb
+    p._update_ledger(7, [("nas", "10.0.0.6", "lease")], ["nas"])
+    kinds = [s[0] for s in fdb.statements]
+    check(
+        kinds == ["DELETE", "INSERT"] and fdb.committed,
+        f"_update_ledger: removals are applied BEFORE upserts, so an update leaves the new row (got {kinds})",
+    )
+
+    # ── 1.0.2: one Pi-hole session per sync, logged out at the end ───────────
+    calls = []
+    real_http, real_sid = p._http_call, p._pihole_sid
+    p._http_call = lambda method, url, **kw: (calls.append((method, url, kw.get("headers"))), (204, None))[1]
+    p._pihole_sid = lambda target: "SID123"
+    pihole = {"kind": "pihole", "url": "http://pi.hole", "allow_self_signed": 0}
+    with p._remote_session(pihole) as sid:
+        seen = sid
+    check(seen == "SID123", "_remote_session: yields the one Pi-hole session id")
+    check(
+        calls == [("DELETE", "http://pi.hole/api/auth", {"X-FTL-SID": "SID123"})],
+        f"_remote_session: logs the session out with DELETE /api/auth on the way out (got {calls})",
+    )
+    calls.clear()
+    try:
+        with p._remote_session(pihole):
+            raise RuntimeError("boom")
+    except RuntimeError:
+        pass
+    check(len(calls) == 1, "_remote_session: still logs out when the sync body raises")
+    calls.clear()
+    with p._remote_session({"kind": "adguard", "url": "http://ag", "allow_self_signed": 0}) as sid:
+        seen = sid
+    check(seen is None and calls == [], "_remote_session: AdGuard Home has no session to open or close")
+    p._pihole_sid = lambda target: None
+    calls.clear()
+    with p._remote_session(pihole):
+        pass
+    check(calls == [], "_remote_session: a Pi-hole with no password (no sid) has nothing to log out")
+    p._http_call, p._pihole_sid = real_http, real_sid
+
+    # ── 1.0.2: a failed remote fetch aborts the sync ─────────────────────────
+    target = {
+        "id": 4,
+        "name": "pi",
+        "kind": "adguard",
+        "url": "http://ag",
+        "enabled": 1,
+        "previewed_at": "x",
+        "domain": "lan",
+    }
+    p._get_db = lambda: FakeDB([target])
+    p._desired_for_target = lambda t: ({"a": "10.0.0.1"}, {"a": "lease"}, [])
+    p._ledger_for_target = lambda tid: ({}, [])
+    applied, recorded, alerted = [], [], []
+
+    def broken_fetch(t, sid=None):
+        raise p._SyncError("connection refused")
+
+    p._fetch_remote = broken_fetch
+    p._apply_add = lambda t, sid, name, ip: applied.append((name, ip))
+    p._apply_remove = lambda t, sid, name, ip: applied.append((name, ip))
+    p._record_sync_result = lambda tid, msg: recorded.append((tid, msg))
+    p._maybe_alert = lambda t, msg: alerted.append(msg)
+    p._sync_locked(4)
+    check(applied == [], "_sync_locked: a failed fetch of the remote list makes NO per-record call")
+    check(
+        recorded == [(4, "connection refused")] and alerted == ["connection refused"],
+        "_sync_locked: the failure is recorded and alerted once",
+    )
+
+    # ── 1.0.2: a per-target lock — two runs never overlap ────────────────────
+    ran = []
+    p._sync_locked = lambda tid: ran.append(tid)
+    lock = p._lock_for(4)
+    lock.acquire()
+    p._sync_one_target(4)
+    check(ran == [], "_sync_one_target: skips a run while the same target is already syncing")
+    lock.release()
+    p._sync_one_target(4)
+    check(
+        ran == [4] and not p._lock_for(4).locked(),
+        "_sync_one_target: runs when the target is free and releases the lock after",
+    )
+    p._sync_one_target(5)
+    check(ran == [4, 5], "_sync_one_target: a lock on one target never holds up another")
+
+    # ── 1.0.2: who may do what to a target (the routes, restricted callers) ──
+    p._require_write = lambda: True
+    p.flash = lambda msg, cat="message": flashed.append(msg)
+    p.redirect = lambda where: "redirect"
+    p.url_for = lambda *a, **k: "/"
+    p.jsonify = lambda payload: payload
+    p.Response = lambda body, status=200, **k: (body, status)
+    flashed = []
+    boom_db = lambda: (_ for _ in ()).throw(AssertionError("the database was touched"))  # noqa: E731
+    p._touch_target = lambda tid: None
+    row_b = {"id": 9, "subnet_ids": "[2]", "enabled": 0, "previewed_at": "x", "domain": "lan"}
+    row_mixed = {"id": 9, "subnet_ids": "[1, 2]", "enabled": 0, "previewed_at": "x", "domain": "lan"}
+    p._can = only_one
+
+    p._load_target = lambda tid: row_b
+    p._get_db = boom_db
+    check(
+        p.toggle_target(9) == "redirect" and "not found" in flashed[-1].lower(),
+        "toggle: a target in subnets the caller has no access to reads as not found",
+    )
+    p._load_target = lambda tid: row_mixed
+    check(
+        p.toggle_target(9) == "redirect" and "cannot access" in flashed[-1],
+        "toggle: a target that reaches an inaccessible subnet cannot be changed (all-known rule)",
+    )
+    check(
+        p.preview_target(9) == ({"error": "this target covers subnets you cannot access"}, 403),
+        "preview: the same all-known rule, refused with 403 and no stamp",
+    )
+    p._load_target = lambda tid: row_b
+    check(p.preview_target(9) == ({"error": "not found"}, 404), "preview: an invisible target is a 404")
+    check(p.target_records(9) == ({"error": "not found"}, 404), "records: an invisible target is a 404")
+    check(p.export_unbound(9) == ("Target not found.", 404), "export: an invisible target is a 404")
+    p._load_target = lambda tid: {"id": 9, "subnet_ids": "[1]", "enabled": 0, "previewed_at": "x", "domain": "lan"}
+    check(
+        p.delete_target(9) == "redirect" and "every subnet" in flashed[-1],
+        "delete: needs an account that can see every subnet, even for a target wholly in the caller's",
+    )
+    check(
+        p.add_target() == "redirect" and "every subnet" in flashed[-1],
+        "add: a subnet-restricted account cannot create a target",
+    )
+
+    fdb = FakeDB()
+    p._get_db = lambda: fdb
+    p._load_target = lambda tid: {"id": 9, "subnet_ids": "[1]", "enabled": 0, "previewed_at": "x", "domain": "lan"}
+    check(
+        p.toggle_target(9) == "redirect" and any(s[0] == "UPDATE" for s in fdb.statements),
+        "toggle: a target wholly inside the caller's subnets is theirs to change",
+    )
+    p._can = everything
+    fdb = FakeDB()
+    p._get_db = lambda: fdb
+    check(
+        p.delete_target(9) == "redirect" and any(s[0] == "DELETE" for s in fdb.statements),
+        "delete: an unrestricted admin removes it",
+    )
+
+    # ── 1.0.2: record views are filtered row by row (the list AND the export) ─
+    rows = [
+        {"name": "mine", "ip": "10.1.0.5", "source": "lease"},
+        {"name": "theirs", "ip": "10.2.0.5", "source": "lease"},
+        {"name": "nowhere", "ip": "172.16.0.5", "source": "lease"},
+    ]
+    p._ledger_for_target = lambda tid: ({r["name"]: r["ip"] for r in rows}, rows)
+    p._subnet_map = lambda: {1: {"cidr": "10.1.0.0/24"}, 2: {"cidr": "10.2.0.0/24"}}
+    p._can = only_one
+    p._load_target = lambda tid: {"id": 9, "subnet_ids": "[1, 2]", "enabled": 1, "previewed_at": "x", "domain": "lan"}
+    body, status = p.export_unbound(9)
+    check(
+        status == 200 and "mine.lan" in body and "theirs" not in body and "nowhere" not in body,
+        "export: a restricted caller's export holds only their subnets' records",
+    )
+    check(
+        [r["name"] for r in p._visible_records(9)] == ["mine"],
+        "records: a record in no known subnet is not a restricted caller's",
+    )
+    p._can = everything
+    check(
+        [r["name"] for r in p._visible_records(9)] == ["mine", "theirs", "nowhere"],
+        "records: an unrestricted caller sees every record",
+    )
+    body, status = p.export_unbound(9)
+    check("theirs.lan" in body and "nowhere.lan" in body, "export: an unrestricted caller's export is the whole ledger")
 
     # ── register(): actually runs end to end against a stub jen.plugin_api ──
     # (the real v1.0.1 bug: register_alert_type(PLUGIN_ID, "dns_sync_failed",

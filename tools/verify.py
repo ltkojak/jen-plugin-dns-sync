@@ -15,6 +15,11 @@ own tree in a way that silently reaches a plugin:
   * manifest version == top CHANGELOG entry — the version Jen's registry
     pins to is the manifest's; a changelog that says otherwise is the kind
     of drift that makes a release unreviewable after the fact.
+  * no inline style="" attributes — the round-4 UI rule (docs/ui.md in Jen):
+    static declarations belong in the page's own <style> block, so a page
+    can be restyled in one place and a strict style-src stays possible.
+    Toggle visibility with a class or `el.style.display` from a script, which
+    the CSP allows.
   * every POST <form> carries csrf_token — Jen's own tests/test_template_csrf.py
     exists because a form without one 403's on every save with no hint why;
     this plugin's own CI catches that before it ever reaches Jen's bundled-
@@ -40,6 +45,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ZIP_FLAT_FILES = ["manifest.json", "plugin.py", "README.md", "CHANGELOG.md", "LICENSE", ".enabled"]
 
 _INLINE_HANDLER_RE = re.compile(r"""\son[a-z]+\s*=\s*["']""", re.I)
+_INLINE_STYLE_RE = re.compile(r"""\sstyle\s*=\s*["']""", re.I)
 _SCRIPT_OPEN_RE = re.compile(r"<script\b[^>]*>", re.I)
 _CHANGELOG_HEAD_RE = re.compile(r"^## \[(\d+\.\d+\.\d+)\]", re.M)
 # Same pattern as Jen's own tests/test_plugin_template_csrf.py, copied here
@@ -157,6 +163,8 @@ def check_templates():
             except Exception as e:
                 fail(f"{rel}: Jinja parse error: {e}")
             for lineno, line in enumerate(src.splitlines(), 1):
+                if _INLINE_STYLE_RE.search(line):
+                    fail(f"{rel}:{lineno}: inline style attribute (use the page's <style> block): {line.strip()[:80]}")
                 if _INLINE_HANDLER_RE.search(line):
                     fail(f"{rel}:{lineno}: inline event handler (blocked by Jen's CSP): {line.strip()[:80]}")
             for sm in _SCRIPT_OPEN_RE.finditer(src):
@@ -170,7 +178,9 @@ def check_templates():
     if count == 0:
         fail("no templates found under templates/")
     elif not any(f.startswith("templates/") for f in failures):
-        ok(f"{count} template(s) parse; no inline handlers; every <script> nonce'd; every POST form has csrf_token")
+        ok(
+            f"{count} template(s) parse; no inline handlers or style attributes; every <script> nonce'd; every POST form has csrf_token"
+        )
 
 
 def check_line_endings():

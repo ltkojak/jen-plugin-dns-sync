@@ -6,12 +6,16 @@ Pushes DHCP names — from active leases, Kea reservations, and [IPAM Lite](http
 
 ## Requirements
 
-- [Jen](https://github.com/ltkojak/jen-kea) v5.57.0 or later
+- [Jen](https://github.com/ltkojak/jen-kea) v5.65.2 or later
 - A Pi-hole v6 install (the REST API introduced with `pihole-FTL` v6) or an AdGuard Home install with its `/control` API reachable from the Jen host
 
 ## Why a ledger, not a mirror
 
 DNS Sync never treats the remote server's whole record set as something it owns. Every record it creates is written to its own ledger table, and every sync — the debounced event-driven one and the 15-minute reconcile — only ever proposes removing a name that's *in that ledger*. A record you (or anything else) added to Pi-hole or AdGuard by hand is never touched, even if DNS Sync's desired set changes underneath it and even though the remote server's own record list is fetched and compared on every sync (to catch drift, not to decide what's safe to delete).
+
+## Who can do what
+
+A target is an **all-known object**: it holds the DNS server's credential and pushes the names of every subnet it lists. Acting on it (Preview, Enable, Pause) needs access to *every* one of those subnets; creating and deleting a target is for accounts that can see every subnet; a target that lists no subnet is for those accounts alone. Only *seeing* is scoped: one accessible subnet is enough to see that a target exists, and its record list and Unbound export are filtered record by record by where each address lives. A target you cannot see is answered like one that does not exist. Viewers can look but never change anything.
 
 ## Mandatory preview
 
@@ -36,9 +40,9 @@ To install by hand instead (a checkout without registry access), unzip `plugin.z
 
 ## Development
 
-`python3 tools/verify.py --build` rebuilds `plugin.zip` deterministically from the tree and runs the same checks CI runs on every push and tag: the zip matches the tree byte-for-byte, no template carries an inline event handler, an un-nonce'd `<script>`, or a POST form missing `csrf_token` (Jen's CSP and CSRF protection would silently break all three), `manifest.json`'s version matches the top `CHANGELOG.md` entry, and `plugin.py` compiles and passes ruff. The committed `plugin.zip` is the artifact Jen installs, so rebuild it in the same commit as any change.
+`python3 tools/verify.py --build` rebuilds `plugin.zip` deterministically from the tree and runs the same checks CI runs on every push and tag: the zip matches the tree byte-for-byte, no template carries an inline event handler, an inline `style=` attribute, an un-nonce'd `<script>`, or a POST form missing `csrf_token` (Jen's CSP and CSRF protection would silently break the first, third and fourth), `manifest.json`'s version matches the top `CHANGELOG.md` entry, and `plugin.py` compiles and passes ruff. The committed `plugin.zip` is the artifact Jen installs, so rebuild it in the same commit as any change.
 
-`python3 tools/test_plugin.py` exercises every pure function — name normalisation, the collision-suffixing dedupe, the source-priority merge, the planner (including the foreign-record invariant), the Pi-hole hosts-line parser, the Unbound export, and the debounce state machine — against hand-built inputs, no Jen, database, or network access needed.
+`python3 tools/test_plugin.py` exercises every pure function — name normalisation, the collision-suffixing dedupe, the source-priority merge, the planner (including the foreign-record invariant), the Pi-hole hosts-line parser, the Unbound export, and the debounce state machine — plus the applier (an IP change leaves exactly one record), the Pi-hole session, the per-target lock and every by-id route's authorization, against hand-built inputs and fakes, no Jen, database, or network access needed.
 
 ## API references
 

@@ -1166,7 +1166,8 @@ def add_target():
         flash(f"{name} added — run Preview before enabling it.", "success")
         _audit("DNSSYNC_ADD_TARGET", name, f"kind={kind} url={url}")
     except Exception as e:
-        flash(f"Could not add target: {e}", "error")
+        logger.error(f"DNS Sync: could not add target: {e}")
+        flash("Could not add target; the details are in Jen's log.", "error")
     finally:
         if db:
             db.close()
@@ -1243,7 +1244,8 @@ def toggle_target(target_id):
         if new_enabled:
             _touch_target(target_id)
     except Exception as e:
-        flash(f"Could not update target: {e}", "error")
+        logger.error(f"DNS Sync: could not update target: {e}")
+        flash("Could not update target; the details are in Jen's log.", "error")
     finally:
         if db:
             db.close()
@@ -1271,7 +1273,8 @@ def delete_target(target_id):
         flash("Target removed. Jen does not delete its records from the remote server automatically.", "success")
         _audit("DNSSYNC_DELETE_TARGET", str(target_id), "target removed")
     except Exception as e:
-        flash(f"Could not remove target: {e}", "error")
+        logger.error(f"DNS Sync: could not remove target: {e}")
+        flash("Could not remove target; the details are in Jen's log.", "error")
     finally:
         if db:
             db.close()

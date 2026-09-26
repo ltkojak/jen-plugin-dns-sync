@@ -97,6 +97,12 @@ def check(cond, msg):
         print(f"FAIL  {msg}")
 
 
+class _Form(dict):
+    def getlist(self, key):
+        v = self.get(key)
+        return [] if v is None else [v] if isinstance(v, str) else list(v)
+
+
 def main():
     p = load_plugin()
 
@@ -559,6 +565,33 @@ def main():
     )
     body, status = p.export_unbound(9)
     check("theirs.lan" in body and "nowhere.lan" in body, "export: an unrestricted caller's export is the whole ledger")
+
+    # ── 1.0.3: a database failure never reaches the page ─────────────────────
+    def db_down(*a, **k):
+        raise RuntimeError("Access denied for user 'jen'@'10.9.9.9' marker-q96")
+
+    flashed.clear()
+    p._can = everything
+    p._require_write = lambda: True
+    p._accessible_subnets = lambda: {1: {}}
+    p._get_db = db_down
+    p.request = types.SimpleNamespace(
+        form={
+            "name": "x",
+            "kind": "pihole",
+            "url": "http://192.0.2.9",
+            "domain": "lan",
+            "sources": "leases",
+            "scope_all": "on",
+        },
+        args={},
+    )
+    p.request.form = _Form(p.request.form)
+    p.add_target()
+    check(
+        flashed and all("marker-q96" not in m and "10.9.9.9" not in m for m in flashed) and "Jen's log" in flashed[-1],
+        f"add_target: a database failure shows a generic message and no exception text (got {flashed})",
+    )
 
     # ── register(): actually runs end to end against a stub jen.plugin_api ──
     # (the real v1.0.1 bug: register_alert_type(PLUGIN_ID, "dns_sync_failed",

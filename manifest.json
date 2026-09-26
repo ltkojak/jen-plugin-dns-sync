@@ -1,7 +1,7 @@
 {
   "id": "dns-sync",
   "name": "Local DNS Sync",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Pushes DHCP names into Pi-hole or AdGuard Home local DNS so hostnames like nas.lan resolve without Kea DDNS — Jen only ever touches records it created itself (a ledger), and an Unbound export is offered for setups with no API.",
   "author": "Matthew Thibodeau",
   "requires_jen": "5.65.2",

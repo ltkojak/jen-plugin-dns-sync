@@ -1,5 +1,17 @@
 # Local DNS Sync Plugin — Changelog
 
+## [1.0.3] - 2026-09-26
+
+Requires Jen 5.65.2 or later, like 1.0.2.
+
+### Fixed: database error text reached the page
+
+A failed save put the database's own error message into the page, which can carry a table or column name, a user name or a host address. The details are now written to Jen's log and the page shows a generic message. Jen's test suite now scans every bundled plugin for this and fails on a new one; messages about the outside world this plugin was configured to talk to (a Pi-hole or AdGuard Home's own refusal or connection error, shown on the target) are the deliberate exception, because that text is the diagnostic an operator needs.
+
+### Changed
+
+- `tools/test_plugin.py` runs a failing database through the add route and requires a generic message with no exception text.
+
 ## [1.0.2] - 2026-09-25
 
 Requires Jen 5.65.2 or later (the `can_access_subnet` helper in the plugin API).

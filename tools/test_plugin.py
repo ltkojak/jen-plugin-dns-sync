@@ -80,6 +80,7 @@ def _stub_jen_plugin_api():
     plugin_api.register_periodic = register_periodic
     plugin_api.subscribe = lambda kind, fn: None
     plugin_api.can_access_subnet = lambda subnet_id, *, allow_unattributed=False: True
+    plugin_api.in_placeholders = lambda values: ",".join(["%s"] * len(list(values))) if list(values) else "NULL"
     jen_pkg.plugin_api = plugin_api
     sys.modules["jen"] = jen_pkg
     sys.modules["jen.plugin_api"] = plugin_api
@@ -592,6 +593,50 @@ def main():
         flashed and all("marker-q96" not in m and "10.9.9.9" not in m for m in flashed) and "Jen's log" in flashed[-1],
         f"add_target: a database failure shows a generic message and no exception text (got {flashed})",
     )
+
+    # ── 1.0.4: _desired_for_target / _targets_touched_by_event tolerate a list ──
+    _stub_jen_plugin_api()
+    check(
+        p._target_subnets({"subnet_ids": [1, 2]}) == [1, 2],
+        "_target_subnets: an already-decoded list is accepted, not just a JSON string",
+    )
+    check(
+        p._target_subnets({"subnet_ids": "not json"}) == [], "_target_subnets: malformed JSON is [] , not an exception"
+    )
+    p._leases_for_subnets = lambda ids: []
+    p._reservations_for_subnets = lambda ids: []
+    p._ipam_for_subnets = lambda ids: []
+    for shape in ('{"a": 1}', "[1, 2]"):
+        p._desired_for_target({"subnet_ids": shape, "sources": "leases"})
+    check(True, "_desired_for_target: goes through _target_subnets and never raises on either shape above")
+
+    fdb = FakeDB(selects=[[{"id": 1, "subnet_ids": "[1, 2]"}, {"id": 2, "subnet_ids": "not json"}]])
+    p._get_db = lambda: fdb
+    touched = p._targets_touched_by_event({"subnet_id": 1})
+    check(
+        touched == [1],
+        f"_targets_touched_by_event: a target with malformed subnet_ids is skipped, not an exception (got {touched})",
+    )
+
+    # ── 1.0.4: the index page counts records in ONE query, not one per target ─
+    fdb = FakeDB(
+        selects=[
+            [
+                {"target_id": 1, "ip": "10.1.0.5"},
+                {"target_id": 1, "ip": "172.16.0.9"},
+                {"target_id": 2, "ip": "10.2.0.6"},
+            ]
+        ]
+    )
+    p._get_db = lambda: fdb
+    p._can = only_one
+    p._subnet_map = lambda: {1: {"cidr": "10.1.0.0/24"}, 2: {"cidr": "10.2.0.0/24"}}
+    counts = p._visible_record_counts([1, 2, 3], p._subnet_map())
+    check(
+        len(fdb.statements) == 1 and counts == {1: 1, 2: 0, 3: 0},
+        f"_visible_record_counts: one query for every target, an out-of-subnet record not counted (got {len(fdb.statements)}, {counts})",
+    )
+    check(p._visible_record_counts([], {}) == {}, "_visible_record_counts: no targets, no query")
 
     # ── register(): actually runs end to end against a stub jen.plugin_api ──
     # (the real v1.0.1 bug: register_alert_type(PLUGIN_ID, "dns_sync_failed",

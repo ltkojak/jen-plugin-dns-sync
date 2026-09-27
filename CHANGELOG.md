@@ -1,5 +1,24 @@
 # Local DNS Sync Plugin — Changelog
 
+## [1.0.4] - 2026-09-27
+
+Jen's Q100 sweep: onto Jen 5.65.10's shared helpers, plus a query-count fix from the same audit.
+
+### Fixed
+
+- `_desired_for_target` (what a sync run actually pushes) and `_targets_touched_by_event` (which targets
+  a lease/reservation change should debounce a sync for) each read a target's `subnet_ids` with a bare
+  `json.loads`, while the helper written to tolerate an already-decoded list or malformed JSON
+  (`_target_subnets`) sat unused two functions away. Both go through it now, so a stored value that isn't
+  a clean JSON string array no longer raises out of either path.
+- The target list ran one full ledger query per target just to show its record count. It is one query for
+  every visible target's records now, counted in Python.
+
+### Changed
+
+- The dynamic `IN (...)` placeholder builder delegates to Jen's shared `in_placeholders()`.
+- `tools/test_plugin.py` checks both tolerant reads directly and that the record count is one query.
+
 ## [1.0.3] - 2026-09-26
 
 Requires Jen 5.65.2 or later, like 1.0.2.

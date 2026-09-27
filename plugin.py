@@ -489,9 +489,12 @@ def _audit(action, target, detail):
 
 
 def _in_placeholders(values):
-    """A `%s,%s,...` clause sized to `values`, for a dynamic `IN (...)` —
-    same helper shape as Jen's own add_subnet_restriction()."""
-    return ",".join(["%s"] * len(values))
+    """A `%s,%s,...` clause sized to `values`, for a dynamic `IN (...)`. Every caller here already
+    guards `if not subnet_ids: return []` before reaching this, so the shared helper's empty-list
+    behaviour (`NULL`, valid SQL matching nothing) never actually applies - kept for the day one doesn't."""
+    from jen.plugin_api import in_placeholders
+
+    return in_placeholders(values)
 
 
 def _leases_for_subnets(subnet_ids):
@@ -561,7 +564,7 @@ def _ipam_for_subnets(subnet_ids):
 
 def _desired_for_target(target):
     """(desired `{name: ip}`, source_by_name `{name: source}`, skipped)."""
-    subnet_ids = json.loads(target.get("subnet_ids") or "[]")
+    subnet_ids = _target_subnets(target)  # tolerates a list or malformed JSON; a bare json.loads did not
     sources = set((target.get("sources") or "").split(",")) & set(_SOURCES)
     raw = build_desired(
         sources,
@@ -981,7 +984,7 @@ def _targets_touched_by_event(event):
         return [r["id"] for r in rows]
     out = []
     for r in rows:
-        if subnet_id in json.loads(r["subnet_ids"] or "[]"):
+        if subnet_id in _target_subnets(r):  # tolerates a list or malformed JSON; a bare json.loads did not
             out.append(r["id"])
     return out
 
@@ -1058,6 +1061,33 @@ def _visible_records(target_id):
     return [r for r in rows if _can(_derive_subnet_id(r["ip"], subnet_map))]
 
 
+def _visible_record_counts(target_ids, subnet_map):
+    """{target_id: count of ledger rows the session user may see}, for every id in `target_ids`, in
+    ONE query. The index page used to call `_visible_records` (its own full `_ledger_for_target`
+    query) once per row just to get its length; a page with many targets ran one query per target."""
+    target_ids = list(target_ids)
+    counts = dict.fromkeys(target_ids, 0)
+    if not target_ids:
+        return counts
+    db = None
+    try:
+        db = _get_db()
+        with db.cursor() as cur:
+            cur.execute(
+                f"SELECT target_id, ip FROM ds_records WHERE target_id IN ({_in_placeholders(target_ids)})",  # nosec B608 - only `%s` placeholders are interpolated; every value is bound
+                tuple(target_ids),
+            )
+            for row in cur.fetchall():
+                if _can(_derive_subnet_id(row["ip"], subnet_map)):
+                    counts[row["target_id"]] = counts.get(row["target_id"], 0) + 1
+    except Exception as e:
+        logger.error(f"DNS Sync: record count read failed: {e}")
+    finally:
+        if db:
+            db.close()
+    return counts
+
+
 def _reachable_target(target_id):
     """The target when the caller may see it at all, else None — the same answer for a
     target that does not exist and one in subnets the caller has no access to."""
@@ -1070,16 +1100,20 @@ def _reachable_target(target_id):
 @bp.route("/")
 @login_required
 def index():
-    rows = []
+    subnet_map = _subnet_map()
+    visible = []
     for r in _target_rows():
         ids = _target_subnets(r)
         if not target_visible(ids, _can):
             continue
         r["can_manage"] = target_manageable(ids, _can)
-        r["record_count"] = len(_visible_records(r["id"]))
+        visible.append(r)
+    counts = _visible_record_counts([r["id"] for r in visible], subnet_map)
+    rows = []
+    for r in visible:
+        r["record_count"] = counts.get(r["id"], 0)
         rows.append(r)
     accessible = _accessible_subnets()
-    subnet_map = _subnet_map()
     accessible_subnets = [
         {"id": sid, "name": subnet_map.get(sid, {}).get("name") or f"subnet {sid}"} for sid in sorted(accessible)
     ]

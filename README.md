@@ -6,7 +6,7 @@ Pushes DHCP names — from active leases, Kea reservations, and [IPAM Lite](http
 
 ## Requirements
 
-- [Jen](https://github.com/ltkojak/jen-kea) v5.65.2 or later
+- [Jen](https://github.com/ltkojak/jen-kea) v5.65.10 or later
 - A Pi-hole v6 install (the REST API introduced with `pihole-FTL` v6) or an AdGuard Home install with its `/control` API reachable from the Jen host
 
 ## Why a ledger, not a mirror

@@ -1,5 +1,22 @@
 # Local DNS Sync Plugin — Changelog
 
+## [1.1.0] - 2026-10-04
+
+Requires Jen 5.68.0 (a 5.68.0 beta satisfies it): this release registers an **investigation provider**.
+
+### Added: the DNS records that carry its name, on Jen's Investigation page
+
+Jen's Investigation page (`/client`) now has a "What else Jen knows" section on its Overview, and this plugin
+contributes one card to it: the records DNS Sync pushed under the client's hostname (its own, its leases' and its
+reservations') or onto its addresses, on each target, and whether each one matches what the client holds. A record whose
+name is the client's but whose address is not, or whose address is the client's but whose name is not, makes it a
+"Needs a look" card, and its sentence also joins the Investigation page's one-line answer. A client with no record adds
+no card.
+
+A target is shown only to a caller who may see one of its subnets, and a record only to one who may see the subnet its
+address lives in; an address in no Kea subnet is for unrestricted callers only. Both are judged in the plugin's own
+filter against the scope Jen handed over. `requires_jen` moves to 5.68.0 because the hook does not exist before it.
+
 ## [1.0.4] - 2026-09-27
 
 Jen's Q100 sweep: onto Jen 5.65.10's shared helpers, plus a query-count fix from the same audit.

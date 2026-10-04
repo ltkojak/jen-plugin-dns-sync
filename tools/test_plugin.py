@@ -79,6 +79,7 @@ def _stub_jen_plugin_api():
     plugin_api.register_alert_type = register_alert_type
     plugin_api.register_periodic = register_periodic
     plugin_api.subscribe = lambda kind, fn: None
+    plugin_api.register_investigation_provider = lambda *a, **k: INVESTIGATION_CALLS.append((a, k))
     plugin_api.can_access_subnet = lambda subnet_id, *, allow_unattributed=False: True
     plugin_api.in_placeholders = lambda values: ",".join(["%s"] * len(list(values))) if list(values) else "NULL"
     jen_pkg.plugin_api = plugin_api
@@ -88,6 +89,7 @@ def _stub_jen_plugin_api():
 
 
 failures = []
+INVESTIGATION_CALLS = []  # every register_investigation_provider() call
 
 
 def check(cond, msg):
@@ -656,6 +658,96 @@ def main():
     check(
         len(tick_calls) == 1 and tick_calls[0][3] == 15,
         f"register(): the reconcile tick is registered every 15 minutes (got {tick_calls})",
+    )
+    check(
+        len(INVESTIGATION_CALLS) == 1
+        and INVESTIGATION_CALLS[0][0] == ("dns-sync",)
+        and INVESTIGATION_CALLS[0][1]["fn"] is p._investigate,
+        "register(): exactly one investigation provider, the plugin's own",
+    )
+
+    # ── 1.1.0: the investigation provider ────────────────────────────────────
+    ns = types.SimpleNamespace
+    check(
+        p.in_scope(1, [1], False) and not p.in_scope(2, [1], False) and not p.in_scope(None, [1], False),
+        "in_scope: a restricted caller sees only its own subnets, and None is never allow",
+    )
+    check(p.in_scope(None, [], True), "in_scope: an unrestricted caller sees an unattributed address")
+    subject = ns(
+        hostname="Desk_PC.lan", ip="10.1.0.5", leases4=[{"ip": "10.1.0.5", "hostname": "desk-pc"}],
+        reservations=[{"ip": "10.1.0.6", "hostname": "Other.example.com"}],
+    )  # fmt: skip
+    check(
+        p.subject_names(subject) == ["desk-pc", "other"],
+        f"subject_names: normalised the way a sync normalises, de-duplicated (got {p.subject_names(subject)})",
+    )
+    check(
+        p.subject_addresses(subject) == ["10.1.0.5", "10.1.0.6"],
+        "subject_addresses: the typed address, the leases and the reservations",
+    )
+    check(p.investigation_card([], ["a"], ["10.0.0.1"]) is None, "investigation_card: no record adds no card")
+    good = {"name": "desk-pc", "ip": "10.1.0.5", "target_name": "pihole", "domain": "lan", "subnet_ids": "[1]"}
+    card = p.investigation_card([good], ["desk-pc"], ["10.1.0.5"])
+    check(
+        card["status"] == "ok"
+        and "1 record on pihole, all matching" in card["summary"]
+        and card["rows"][0]["value"] == "desk-pc.lan -> 10.1.0.5 (matches the lease or reservation)",
+        f"investigation_card: a matching record is an ok card (got {card})",
+    )
+    stale = dict(good, ip="10.1.0.99")
+    card = p.investigation_card([good, stale], ["desk-pc"], ["10.1.0.5"])
+    check(
+        card["status"] == "warn"
+        and card["summary"].startswith("1 of 2 records on pihole do not match")
+        and "its address is not one this client holds" in card["rows"][1]["value"],
+        f"investigation_card: a name pointing at an address the client does not hold is a warn card (got {card['summary']!r})",
+    )
+    renamed = dict(good, name="old-name")
+    card = p.investigation_card([renamed], ["desk-pc"], ["10.1.0.5"])
+    check(
+        card["status"] == "warn" and "its name is not one this client has" in card["rows"][0]["value"],
+        "investigation_card: an address carrying a name the client does not have is a warn card",
+    )
+
+    # the impure provider, end to end through the plugin's own query and filters
+    p._subnet_map = lambda: {1: {"cidr": "10.1.0.0/24"}, 2: {"cidr": "10.2.0.0/24"}}
+    fdb = FakeDB([[dict(good)]])
+    p._get_db = lambda: fdb
+    got = p._investigate(subject, [1], False)
+    kind, sql, params = fdb.statements[0]
+    check(
+        got is not None and got["href"] == "/network/dns-sync" and got["status"] == "ok",
+        f"_investigate: the card for a seeded client, linking to the plugin's own page (got {got})",
+    )
+    check(
+        "r.name IN (%s,%s)" in sql
+        and "r.ip IN (%s,%s)" in sql
+        and params == ("desk-pc", "other", "10.1.0.5", "10.1.0.6"),
+        f"_investigate: names and addresses are bound parameters of the one query (got {sql!r}, {params})",
+    )
+    p._get_db = lambda: FakeDB([[dict(good)]])
+    check(
+        p._investigate(subject, [2], False) is None,
+        "_investigate: a target and a record in subnets the caller cannot see are dropped",
+    )
+    p._get_db = lambda: FakeDB([[dict(good, subnet_ids="[2]")]])
+    check(
+        p._investigate(subject, [1], False) is None,
+        "_investigate: a record in the caller's subnet on a target scoped only to others' subnets is dropped",
+    )
+    p._get_db = lambda: FakeDB([[dict(good, ip="172.16.0.5", subnet_ids="[1]")]])
+    check(
+        p._investigate(subject, [1], False) is None and p._investigate(subject, [], True) is not None,
+        "_investigate: an address in no Kea subnet is for an unrestricted caller only",
+    )
+    p._get_db = lambda: FakeDB([[]])
+    check(p._investigate(subject, [1], False) is None, "_investigate: an unknown client gets None")
+    fdb = FakeDB()
+    p._get_db = lambda: fdb
+    check(
+        p._investigate(ns(hostname="", ip="", leases4=[], reservations=[]), None, True) is None
+        and fdb.statements == [],
+        "_investigate: a subject with no name and no address runs no query",
     )
 
     if failures:

@@ -1018,6 +1018,131 @@ def _reconcile_tick():
             logger.error(f"DNS Sync: reconcile of target {target_id} failed: {e}")
 
 
+# ── Investigation provider (v1.1.0, Jen 5.68.0) ──────────────────────────────
+
+_INVESTIGATION_MAX_RECORDS = 10
+
+
+def in_scope(subnet_id, accessible_subnet_ids, all_subnets):
+    """Pure: may a caller with this scope see something whose subnet is `subnet_id`? An unrestricted caller may; a
+    restricted one only for a subnet in its own set - and a subnet of None ("no attributable subnet") is for unrestricted
+    callers only, never read as allow."""
+    if all_subnets:
+        return True
+    return subnet_id is not None and subnet_id in set(accessible_subnet_ids or ())
+
+
+def subject_names(subject):
+    """Pure: the DNS labels this client is known by - its hostname, its leases' and its reservations' - normalised the way
+    a sync normalises them (a name with a domain on it is cut to its first label), de-duplicated, capped."""
+    raw = [getattr(subject, "hostname", "")]
+    raw += [r.get("hostname") for r in (getattr(subject, "leases4", None) or []) if isinstance(r, dict)]
+    raw += [r.get("hostname") for r in (getattr(subject, "reservations", None) or []) if isinstance(r, dict)]
+    names = []
+    for value in raw:
+        name, _why = normalize_name(str(value or "").split(".")[0])
+        if name and name not in names:
+            names.append(name)
+    return names[:6]
+
+
+def subject_addresses(subject):
+    """Pure: the IPv4 addresses this client holds - the one the page was opened on, its leases and its reservations."""
+    seen = []
+    candidates = [getattr(subject, "ip", "")]
+    candidates += [r.get("ip") for r in (getattr(subject, "leases4", None) or []) if isinstance(r, dict)]
+    candidates += [r.get("ip") for r in (getattr(subject, "reservations", None) or []) if isinstance(r, dict)]
+    for raw in candidates:
+        try:
+            addr = str(ipaddress.IPv4Address(str(raw).strip()))
+        except ValueError:
+            continue
+        if addr not in seen:
+            seen.append(addr)
+    return seen[:6]
+
+
+def investigation_card(records, names, addresses):
+    """Pure: the Investigation page's card from the ledger records Jen pushed that carry this client's name or address, or
+    None when there are none. A record whose name is the client's but whose address is not one it holds, or whose address is
+    the client's but whose name is not one it has, does not match - DNS answers something the lease or reservation does not -
+    and makes it a warn card."""
+    if not records:
+        return None
+    rows, bad = [], 0
+    for r in records[:_INVESTIGATION_MAX_RECORDS]:
+        name_ok = r["name"] in names
+        addr_ok = r["ip"] in addresses
+        matches = name_ok and addr_ok
+        if not matches:
+            bad += 1
+        fqdn = f"{r['name']}.{r['domain']}" if r.get("domain") else r["name"]
+        verdict = (
+            "matches the lease or reservation"
+            if matches
+            else ("its address is not one this client holds" if name_ok else "its name is not one this client has")
+        )
+        rows.append({"label": r.get("target_name") or "DNS target", "value": f"{fqdn} -> {r['ip']} ({verdict})"})
+    targets = sorted({r.get("target_name") or "a DNS target" for r in records[:_INVESTIGATION_MAX_RECORDS]})
+    where = ", ".join(targets)
+    if bad:
+        summary = (
+            f"{bad} of {len(rows)} record{'s' if len(rows) != 1 else ''} on {where} do not match what this client holds"
+        )
+    else:
+        summary = f"{len(rows)} record{'s' if len(rows) != 1 else ''} on {where}, all matching what this client holds"
+    return {"summary": summary, "status": "warn" if bad else "ok", "rows": rows}
+
+
+def _records_for_client(names, addresses):
+    identity, params = [], []
+    if names:
+        identity.append(f"r.name IN ({_in_placeholders(names)})")
+        params.extend(names)
+    if addresses:
+        identity.append(f"r.ip IN ({_in_placeholders(addresses)})")
+        params.extend(addresses)
+    if not identity:
+        return []
+    db = None
+    try:
+        db = _get_db()
+        with db.cursor() as cur:
+            cur.execute(
+                f"SELECT r.name, r.ip, t.name AS target_name, t.domain, t.subnet_ids FROM ds_records r "  # nosec B608 - the IN lists are %s placeholders sized to the values; every value is bound below
+                f"JOIN ds_targets t ON t.id = r.target_id WHERE {' OR '.join(identity)} "
+                f"ORDER BY t.name, r.name LIMIT 100",
+                tuple(params),
+            )
+            return list(cur.fetchall())
+    finally:
+        if db:
+            db.close()
+
+
+def _investigate(subject, accessible_subnet_ids, all_subnets):
+    """The Investigation page's card for the client Jen resolved: the records DNS Sync pushed under its hostname or onto its
+    addresses. A target is seen only by a caller who may see one of its subnets, and a record only by one who may see the
+    subnet its address lives in (an address in no Kea subnet is for unrestricted callers only) - both judged against the
+    scope Jen handed over, in the plugin's own filter, never taken on trust."""
+    names, addresses = subject_names(subject), subject_addresses(subject)
+
+    def can(subnet_id):
+        return in_scope(subnet_id, accessible_subnet_ids, all_subnets)
+
+    candidates = _records_for_client(names, addresses)
+    if not candidates:
+        return None
+    subnet_map = _subnet_map()
+    records = [
+        r for r in candidates if target_visible(_target_subnets(r), can) and can(_derive_subnet_id(r["ip"], subnet_map))
+    ]
+    card = investigation_card(records, names, addresses)
+    if card is not None:
+        card["href"] = "/network/dns-sync"
+    return card
+
+
 # ── Routes: page ────────────────────────────────────────────────────────────
 
 
@@ -1344,7 +1469,7 @@ def export_unbound(target_id):
 def register(app):
     app.register_blueprint(bp)
 
-    from jen.plugin_api import register_alert_type, register_periodic, subscribe
+    from jen.plugin_api import register_alert_type, register_investigation_provider, register_periodic, subscribe
 
     register_alert_type(
         PLUGIN_ID,
@@ -1358,5 +1483,6 @@ def register(app):
         subscribe(kind, _on_relevant_event)
 
     register_periodic(PLUGIN_ID, "reconcile", _reconcile_tick, 15)
+    register_investigation_provider(PLUGIN_ID, title="Local DNS Sync", fn=_investigate)
 
     logger.info("Local DNS Sync plugin registered")

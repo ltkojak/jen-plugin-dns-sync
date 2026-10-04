@@ -6,7 +6,7 @@ Pushes DHCP names — from active leases, Kea reservations, and [IPAM Lite](http
 
 ## Requirements
 
-- [Jen](https://github.com/ltkojak/jen-kea) v5.65.10 or later
+- [Jen](https://github.com/ltkojak/jen-kea) v5.68.0 or later
 - A Pi-hole v6 install (the REST API introduced with `pihole-FTL` v6) or an AdGuard Home install with its `/control` API reachable from the Jen host
 
 ## Why a ledger, not a mirror
@@ -30,6 +30,7 @@ A target starts paused. The **Preview** button runs the full planner — normali
 - **Per-target scope**: pick specific Kea subnets or "all I can access" (resolved to an explicit list when you save, not re-derived from whoever happens to be logged in when a background sync runs)
 - **TLS verified by default**, with a per-target "allow a self-signed certificate" switch for a Pi-hole or AdGuard install using one
 - Credentials are stored encrypted and never rendered back — the form just shows a password field, blank, every time
+- **On the Investigation page** (Jen 5.68.0): a card under "What else Jen knows" with the records pushed under a client's name or onto its addresses, per target, and whether they match its lease or reservation
 - **Export "Unbound local-data"**: Unbound has no write API, so any target's current ledger can be downloaded as a ready-to-include `local-data:` snippet instead
 
 ## Installation

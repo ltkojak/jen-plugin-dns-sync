@@ -81,6 +81,7 @@ def _stub_jen_plugin_api():
     plugin_api.subscribe = lambda kind, fn: None
     plugin_api.register_investigation_provider = lambda *a, **k: INVESTIGATION_CALLS.append((a, k))
     plugin_api.can_access_subnet = lambda subnet_id, *, allow_unattributed=False: True
+    plugin_api.ACTIVE_LEASE4 = "state = 0 AND expire > NOW()"
     plugin_api.in_placeholders = lambda values: ",".join(["%s"] * len(list(values))) if list(values) else "NULL"
     jen_pkg.plugin_api = plugin_api
     sys.modules["jen"] = jen_pkg
@@ -749,6 +750,19 @@ def main():
         and fdb.statements == [],
         "_investigate: a subject with no name and no address runs no query",
     )
+
+    # ── 1.1.1: only a CURRENT lease feeds the DNS records (Jen's ACTIVE_LEASE4, never a bare state = 0) ──
+    q = load_plugin()
+    _stub_jen_plugin_api()
+    kdb = FakeDB([[{"ip": "10.0.0.5", "hostname": "nas", "subnet_id": 1}]])
+    q._get_kea_db = lambda: kdb
+    rows = q._leases_for_subnets([1, 2])
+    sql = " ".join(s[1] for s in kdb.statements)
+    check(
+        "state = 0 AND expire > NOW()" in sql and "state=0" not in sql,
+        f"_leases_for_subnets: the query asks for a current lease, not a bare state = 0 (got {sql!r})",
+    )
+    check(rows and rows[0]["hostname"] == "nas", "_leases_for_subnets: the rows come back unchanged")
 
     if failures:
         print(f"\n{len(failures)} check(s) failed")

@@ -1,5 +1,13 @@
 # Local DNS Sync Plugin — Changelog
 
+## [1.1.1] - 2026-10-07
+
+Requires Jen 5.68.0 (a 5.68.0 beta satisfies it); the constant this release uses is exported by Jen 5.68.0-beta.18 and later.
+
+### Fixed: the leases that feed its DNS records
+
+The lease source asked Kea for rows at `state=0` and nothing more. Kea keeps a lease row at state 0 past its expiry until reclamation removes it, so a lease that had already ended still supplied a name, and a name for an address that was no longer in use was pushed to Pi-hole or AdGuard Home (and kept there while the stale row lingered). The query now uses Jen's one definition of a current lease, `ACTIVE_LEASE4` (state 0 AND not past its expiry), exported through `jen.plugin_api`; the harness proves the query asks for it and that the plugin never spells the predicate itself.
+
 ## [1.1.0] - 2026-10-04
 
 Requires Jen 5.68.0 (a 5.68.0 beta satisfies it): this release registers an **investigation provider**.

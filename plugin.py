@@ -408,6 +408,13 @@ def _get_kea_db():
     return get_kea_db()
 
 
+def _active_lease4():
+    """Jen's one definition of a CURRENT lease (state 0 AND not past its expiry) - never spelled here (Jen 5.68.0, Q153)."""
+    from jen.plugin_api import ACTIVE_LEASE4
+
+    return ACTIVE_LEASE4
+
+
 def _subnet_map():
     from jen.plugin_api import subnet_map
 
@@ -506,7 +513,7 @@ def _leases_for_subnets(subnet_ids):
         with db.cursor() as cur:
             cur.execute(
                 f"SELECT inet_ntoa(address) AS ip, hostname, subnet_id FROM lease4 "  # nosec B608 - only `%s` placeholders are interpolated; every value is bound
-                f"WHERE state=0 AND hostname IS NOT NULL AND hostname != '' "
+                f"WHERE {_active_lease4()} AND hostname IS NOT NULL AND hostname != '' "
                 f"AND subnet_id IN ({_in_placeholders(subnet_ids)})",
                 tuple(subnet_ids),
             )

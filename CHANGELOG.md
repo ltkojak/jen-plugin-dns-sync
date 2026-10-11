@@ -1,5 +1,20 @@
 # Local DNS Sync Plugin — Changelog
 
+## [1.1.2] - 2026-10-11
+
+Fix. `requires_jen` stays 5.68.0; the `scoped` argument of `send_alert` this release uses is in Jen 5.68.0-beta.9 and later.
+
+### Fixed: the sync-failed alert no longer goes to channels limited to some subnets
+
+The *DNS sync failed* alert is about a whole target, not one subnet: a target syncs the records of every subnet it is set up for, so the alert
+has no subnet id. Jen delivers an alert with no subnet id to every channel, a channel the operator limited to particular subnets included, and
+this alert's text carries the error summary, which names the hostnames that failed from any of those subnets. A person who limited a channel
+to one subnet was receiving the names of hosts in the others. The alert is now sent with `scoped=True`, which Jen reads as "about something that
+cannot be placed in one subnet": only channels with no subnet scope receive it. The text, the cooldown and what the page shows are unchanged.
+
+The harness runs the real `_maybe_alert` and requires `subnet_id=None` with `scoped=True`, the cooldown stamp still written, and nothing sent
+inside the cooldown.
+
 ## [1.1.1] - 2026-10-07
 
 Requires Jen 5.68.0 (a 5.68.0 beta satisfies it); the constant this release uses is exported by Jen 5.68.0-beta.18 and later.

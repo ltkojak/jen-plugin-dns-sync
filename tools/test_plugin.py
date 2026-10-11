@@ -764,6 +764,40 @@ def main():
     )
     check(rows and rows[0]["hostname"] == "nas", "_leases_for_subnets: the rows come back unchanged")
 
+    # ── 1.1.2: the failure alert has no subnet, so it is sent scoped=True: a channel limited to some subnets never receives it ──
+    _stub_jen_plugin_api()
+    sent_alerts = []
+    sys.modules["jen.plugin_api"].send_alert = lambda alert_type, **kw: sent_alerts.append((alert_type, kw))
+    r = load_plugin()  # an untouched copy: p._maybe_alert was replaced by a recorder above
+    stamps = FakeDB()
+    r._get_db = lambda: stamps
+    r._maybe_alert(
+        {"id": 4, "name": "pihole", "kind": "pihole", "last_alert_at": None},
+        "could not add nas.lan 10.0.0.5 (hostnames of any subnet)",
+    )
+    check(
+        len(sent_alerts) == 1
+        and sent_alerts[0][0] == "dns-sync_failed"
+        and sent_alerts[0][1]["subnet_id"] is None
+        and sent_alerts[0][1].get("scoped") is True,
+        f"_maybe_alert: the alert with no subnet is sent with scoped=True (got {sent_alerts})",
+    )
+    check(
+        any("last_alert_at" in s[1] for s in stamps.statements),
+        "_maybe_alert: the cooldown stamp is still written when the alert is sent",
+    )
+    sent_alerts.clear()
+    r._maybe_alert(
+        {
+            "id": 4,
+            "name": "pihole",
+            "kind": "pihole",
+            "last_alert_at": r.datetime.now(r.timezone.utc).replace(tzinfo=None),
+        },
+        "x",
+    )
+    check(sent_alerts == [], "_maybe_alert: inside the cooldown nothing is sent, scoped or not")
+
     if failures:
         print(f"\n{len(failures)} check(s) failed")
         return 1

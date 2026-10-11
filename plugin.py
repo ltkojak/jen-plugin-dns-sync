@@ -937,7 +937,17 @@ def _maybe_alert(target, error_summary):
     try:
         from jen.plugin_api import send_alert
 
-        send_alert("dns-sync_failed", subnet_id=None, name=target["name"], kind=target["kind"], error=error_summary)
+        # v1.1.2 - this alert has no subnet (a target's records span every subnet it syncs) and its text carries the error summary,
+        # which can name hostnames from ANY of them. Without `scoped=True` a "no subnet" alert went to every channel, a channel the
+        # operator limited to some subnets included; with it, only a channel that has no subnet scope receives it.
+        send_alert(
+            "dns-sync_failed",
+            subnet_id=None,
+            scoped=True,
+            name=target["name"],
+            kind=target["kind"],
+            error=error_summary,
+        )
     except Exception as e:
         logger.warning(f"DNS Sync: could not send dns-sync_failed alert: {e}")
 

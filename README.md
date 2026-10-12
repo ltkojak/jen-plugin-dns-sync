@@ -29,7 +29,8 @@ A target starts paused. The **Preview** button runs the full planner — normali
 - **15-minute full reconcile** independent of events, catching anything a debounced sync missed (a restart mid-burst, a target enabled between events, drift from a manual edit on the remote server)
 - **Per-target scope**: pick specific Kea subnets or "all I can access" (resolved to an explicit list when you save, not re-derived from whoever happens to be logged in when a background sync runs)
 - **TLS verified by default**, with a per-target "allow a self-signed certificate" switch for a Pi-hole or AdGuard install using one
-- Credentials are stored encrypted and never rendered back — the form just shows a password field, blank, every time
+- Credentials are stored encrypted and never rendered back — the form just shows a password field, blank, every time. A target's URL is plain text and is printed on the page, so a URL that carries `user:pass@` is refused on save (the credential goes in the password field, AdGuard Home as `user:pass`); a target saved by an earlier version with one in its URL is shown without it. Remove such a target and add it again to clear the stored URL itself.
+- **Recorded, not displayed**: `ds_targets.created_by` (the account that added a target) is written for the audit trail and is not shown anywhere on the page; there is no migration to drop it.
 - **On the Investigation page** (Jen 5.68.0): a card under "What else Jen knows" with the records pushed under a client's name or onto its addresses, per target, and whether they match its lease or reservation
 - **Export "Unbound local-data"**: Unbound has no write API, so any target's current ledger can be downloaded as a ready-to-include `local-data:` snippet instead
 

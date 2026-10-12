@@ -247,9 +247,10 @@ document.querySelectorAll('.ds-records-link').forEach(function(a) {
         body.textContent = 'Loading…';
         _dsModal('ds-records-modal', true);
         window.jenFetch('/network/dns-sync/targets/' + id + '/records', {cache: 'no-store'})
-            .then(function(r) { return r.ok ? r.json() : {rows: []}; })
-            .catch(function() { return {rows: []}; })
+            .then(function(r) { return r.ok ? r.json() : {failed: true}; })
+            .catch(function() { return {failed: true}; })
             .then(function(d) {
+                if (d && d.failed) { body.textContent = 'The records could not be loaded.'; return; }
                 var rows = (d && d.rows) || [];
                 if (!rows.length) { body.textContent = 'No records for this target yet.'; return; }
                 var html = '<table class="rowlist"><thead><tr><th>Name</th><th>IP</th><th>Source</th></tr></thead><tbody>';

@@ -1,5 +1,35 @@
 # Local DNS Sync Plugin — Changelog
 
+## [1.1.3] - 2026-10-12
+
+Fix and tidy-up from a whole-tree review of Jen's bundled plugins. `requires_jen` stays 5.68.0 (everything this release imports from `jen.plugin_api` is in 5.68.0 and earlier).
+
+### Fixed: a target's URL cannot carry a password
+
+A URL of the form `http://user:pass@pi.hole` was accepted and stored as typed, so the DNS server's password sat in the plain-text URL column, was printed on the page next to the target's name, and was copied into the audit log's description of the add. The credential has its own field, which is stored encrypted and never shown. Adding a target whose URL has a username or password in it is now refused with one sentence that says where the credential goes; the sentence echoes neither the URL nor the password. A target saved by an earlier version with one in its URL is shown without it (host, port, path and query are kept). The stored value itself is only cleared by removing the target and adding it again, which this release does not do on the operator's behalf.
+
+### Fixed: a database error while loading a target or its ledger was a 500
+
+`_load_target` (behind toggle, delete, Preview, the record list and the Unbound export) and `_ledger_for_target` (behind Preview, the record list, the export and every sync's plan) had no `except`, so a database failure surfaced as an error page, and a failure inside a sync died mid-plan. Both now log the failure (the exception's class name only; nothing from the exception reaches a page) and answer the way the route already answers a target that is not there: a flash saying "Target not found." on the page routes, a 404 on the JSON ones. An unreadable ledger is deliberately not an empty one: it plans nothing and reports "The sync ledger could not be read; the details are in Jen's log." as the sync's error, because a plan made against an empty ledger would re-add every record and lose track of which ones Jen owns. The record list and the export answer 503 in that case rather than an empty list; the page says the records could not be loaded instead of "No records for this target yet."
+
+### Fixed: the Preview route flashed on a role refusal
+
+Preview is fetched by the page's script and reads a JSON answer. A viewer who reached it got a 403 and a flash message, and the flash was queued for whatever page they opened next. It now answers `{"ok": false, "error": "..."}` with the 403 and queues no flash.
+
+### Changed: the copied write gate and placeholder helper are Jen's
+
+The private `_is_admin`, `_require_write` and `_in_placeholders` are gone. The three write routes (add, toggle, delete) are decorated with `jen.plugin_api.require_write`, with this plugin's own sentence and a redirect to its own page, so a viewer sees exactly what they saw before; `_in_placeholders` was already a one-line call to `plugin_api.in_placeholders` and the call sites use it directly. The page's `is_admin` flag is `is_admin_or_above()`. The old `_is_admin` also swallowed an import failure and fell back to reading the account's role itself; that fallback is gone, so a failure to reach Jen's own check refuses rather than guessing. Left as they are, because Jen's API has no equivalent: `_derive_subnet_id` (a plugin-local, pure walk of the subnet map, covered by the harness) and the rest of the target-visibility helpers.
+
+### Removed: a dead map in the debounce wiring
+
+`_debounce_pending` was written on every touch and every fire and read by nothing; the live debounce is the per-target `threading.Timer`. The map and the two statements that fed it are removed. `debounce_schedule` and `debounce_ready` stay, as the pure model the harness pins; the module docstring now says nothing live calls them.
+
+### Documented: a column that is written and never read
+
+`ds_targets.created_by` (the account that added a target) is recorded for the audit trail and is not displayed anywhere on the page. It is not dropped: removing a column from a released table would be a destructive migration for no benefit. The README says so.
+
+The harness gained checks for every item: the gate refuses a viewer on the three write routes with the plugin's sentence and a redirect, the Preview refusal is a JSON 403 with no flash, a URL with userinfo is refused without echoing it (and four URL shapes that only contain an `@` after the host are not mistaken for one), the page prints no userinfo, a failing database leaves `_load_target` and `_ledger_for_target` returning None with a class-name-only log line, an unreadable ledger plans nothing, and the record list and export answer 503.
+
 ## [1.1.2] - 2026-10-11
 
 Fix. `requires_jen` stays 5.68.0; the `scoped` argument of `send_alert` this release uses is in Jen 5.68.0-beta.9 and later.

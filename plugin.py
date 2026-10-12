@@ -69,7 +69,9 @@ remote list is fetched and inspected for drift detection.
 **Debounce.** `debounce_schedule`/`debounce_ready` model "a touch
 pushes a target's fire time `delay_s` out" — repeated touches during a
 burst keep pushing it out, coalescing into one sync after the burst
-quiets down. The live wiring (`_touch_target`/`_fire_debounced_sync`)
+quiets down. They are a model the harness pins, nothing live calls them
+(1.1.3 removed the `_debounce_pending` map that used to be fed through
+them and never read). The live wiring (`_touch_target`/`_fire_debounced_sync`)
 is a plain per-target `threading.Timer`, cancelled and rescheduled on
 each touch; no thread is ever created at import or register() time —
 only later, from inside a real `subscribe()` callback on Jen's already-
@@ -104,6 +106,8 @@ from datetime import datetime, timedelta, timezone
 
 from flask import Blueprint, Response, flash, jsonify, redirect, render_template, request, url_for
 from flask_login import current_user, login_required
+
+from jen.plugin_api import in_placeholders, is_admin_or_above, require_write
 
 logger = logging.getLogger(__name__)
 
@@ -300,6 +304,38 @@ def debounce_ready(pending, now):
     return ready, remaining
 
 
+def _split_url(url):
+    """Pure: `(scheme_and_slashes, authority, rest)` of `url`, splitting on text alone (no parser to raise on a
+    malformed address). `authority` ends at the first `/`, `?` or `#`."""
+    text = url or ""
+    head, sep, tail = text.partition("://")
+    if not sep:
+        head, tail = "", text
+    else:
+        head += sep
+    cut = len(tail)
+    for ch in "/?#":
+        at = tail.find(ch)
+        if at != -1:
+            cut = min(cut, at)
+    return head, tail[:cut], tail[cut:]
+
+
+def url_has_userinfo(url):
+    """Pure: does the URL carry `user:pass@` (or `user@`) in front of its host? A target's credential belongs in the
+    password field, which is stored encrypted; the URL column is plain text and is printed on the page."""
+    return "@" in _split_url(url)[1]
+
+
+def display_url(url):
+    """Pure: `url` with any userinfo removed, for the page. A target saved before 1.1.3 may still hold one in its
+    row; it is never shown."""
+    head, authority, rest = _split_url(url)
+    if "@" not in authority:
+        return url
+    return head + authority.rsplit("@", 1)[1] + rest
+
+
 def resolve_subnet_ids(selected, accessible):
     """Pure: what gets stored in `ds_targets.subnet_ids` at save time.
     `selected=None` means "all accessible to me" — resolved to the
@@ -427,23 +463,7 @@ def _accessible_subnets():
     return get_accessible_subnet_map()
 
 
-def _is_admin():
-    try:
-        from jen.plugin_api import is_admin_or_above
-
-        return is_admin_or_above()
-    except Exception:
-        role = getattr(current_user, "role", None)
-        if role is not None:
-            return role in ("superadmin", "admin")
-        return bool(getattr(current_user, "is_admin", False))
-
-
-def _require_write():
-    if _is_admin():
-        return True
-    flash("Viewers can look at DNS Sync but not change it.", "error")
-    return False
+_VIEWER_MESSAGE = "Viewers can look at DNS Sync but not change it."
 
 
 def _can(subnet_id):
@@ -495,15 +515,6 @@ def _audit(action, target, detail):
 # ── Source queries (impure DB reads, filtered to a target's own subnet scope) ──
 
 
-def _in_placeholders(values):
-    """A `%s,%s,...` clause sized to `values`, for a dynamic `IN (...)`. Every caller here already
-    guards `if not subnet_ids: return []` before reaching this, so the shared helper's empty-list
-    behaviour (`NULL`, valid SQL matching nothing) never actually applies - kept for the day one doesn't."""
-    from jen.plugin_api import in_placeholders
-
-    return in_placeholders(values)
-
-
 def _leases_for_subnets(subnet_ids):
     if not subnet_ids:
         return []
@@ -514,7 +525,7 @@ def _leases_for_subnets(subnet_ids):
             cur.execute(
                 f"SELECT inet_ntoa(address) AS ip, hostname, subnet_id FROM lease4 "  # nosec B608 - only `%s` placeholders are interpolated; every value is bound
                 f"WHERE {_active_lease4()} AND hostname IS NOT NULL AND hostname != '' "
-                f"AND subnet_id IN ({_in_placeholders(subnet_ids)})",
+                f"AND subnet_id IN ({in_placeholders(subnet_ids)})",
                 tuple(subnet_ids),
             )
             return cur.fetchall()
@@ -536,7 +547,7 @@ def _reservations_for_subnets(subnet_ids):
             cur.execute(
                 f"SELECT inet_ntoa(ipv4_address) AS ip, hostname, dhcp4_subnet_id AS subnet_id FROM hosts "  # nosec B608 - only `%s` placeholders are interpolated; every value is bound
                 f"WHERE ipv4_address IS NOT NULL AND ipv4_address > 0 AND hostname IS NOT NULL AND hostname != '' "
-                f"AND dhcp4_subnet_id IN ({_in_placeholders(subnet_ids)})",
+                f"AND dhcp4_subnet_id IN ({in_placeholders(subnet_ids)})",
                 tuple(subnet_ids),
             )
             return cur.fetchall()
@@ -558,7 +569,7 @@ def _ipam_for_subnets(subnet_ids):
             cur.execute(
                 f"SELECT ip, label AS hostname, subnet_id FROM ipam_static_entries "  # nosec B608 - only `%s` placeholders are interpolated; every value is bound
                 f"WHERE subnet_kind='kea' AND entry_status IN ('static','planned') "
-                f"AND label IS NOT NULL AND label != '' AND subnet_id IN ({_in_placeholders(subnet_ids)})",
+                f"AND label IS NOT NULL AND label != '' AND subnet_id IN ({in_placeholders(subnet_ids)})",
                 tuple(subnet_ids),
             )
             return cur.fetchall()
@@ -589,12 +600,21 @@ def _desired_for_target(target):
 
 
 def _ledger_for_target(target_id):
+    """`({name: ip}, rows)` for a target's ledger, or None when it could not be read.
+
+    v1.1.3 - a database failure here used to propagate uncaught: the records list, the Unbound export and a
+    Preview answered with a 500, and a sync died mid-plan. It is None, never `({}, [])`: an unreadable ledger is
+    not an empty one, and a plan made against an empty ledger would re-add every record and forget which ones
+    Jen owns. Each caller turns None into its own plain answer (`_plan_for_target` into a remote_error)."""
     db = None
     try:
         db = _get_db()
         with db.cursor() as cur:
             cur.execute("SELECT name, ip, source FROM ds_records WHERE target_id=%s", (target_id,))
             rows = cur.fetchall()
+    except Exception as e:
+        logger.error(f"DNS Sync: could not read the ledger of target {target_id}: {type(e).__name__}")
+        return None
     finally:
         if db:
             db.close()
@@ -797,7 +817,20 @@ def _plan_for_target(target, sid=None, session_error=None):
     the operator something and say why; a real sync must not act on it —
     `_sync_one_target` aborts when `remote_error` is set."""
     desired, source_by_name, skipped = _desired_for_target(target)
-    ledger, _rows = _ledger_for_target(target["id"])
+    ledger_read = _ledger_for_target(target["id"])
+    if ledger_read is None:
+        # Nothing is planned against a ledger that could not be read (see `_ledger_for_target`); a sync stops on
+        # `remote_error` and a Preview shows it.
+        nothing = {"add": [], "update": [], "remove": []}
+        return (
+            nothing,
+            desired,
+            source_by_name,
+            {},
+            skipped,
+            "The sync ledger could not be read; the details are in Jen's log.",
+        )
+    ledger, _rows = ledger_read
     remote, remote_error = {}, session_error
     if session_error is None:
         try:
@@ -955,15 +988,11 @@ def _maybe_alert(target, error_summary):
 # ── Debounce glue (impure: threading.Timer, driven by the pure state above) ────
 
 _debounce_lock = threading.Lock()
-_debounce_pending: dict[int, datetime] = {}
 _debounce_timers: dict[int, threading.Timer] = {}
 
 
 def _touch_target(target_id):
-    now = datetime.now(timezone.utc)
     with _debounce_lock:
-        global _debounce_pending
-        _debounce_pending = debounce_schedule(_debounce_pending, target_id, now)
         old = _debounce_timers.get(target_id)
         if old is not None:
             old.cancel()
@@ -975,8 +1004,6 @@ def _touch_target(target_id):
 
 def _fire_debounced_sync(target_id):
     with _debounce_lock:
-        global _debounce_pending
-        _, _debounce_pending = debounce_ready(_debounce_pending, datetime.now(timezone.utc))
         _debounce_timers.pop(target_id, None)
     try:
         _sync_one_target(target_id)
@@ -1114,10 +1141,10 @@ def investigation_card(records, names, addresses):
 def _records_for_client(names, addresses):
     identity, params = [], []
     if names:
-        identity.append(f"r.name IN ({_in_placeholders(names)})")
+        identity.append(f"r.name IN ({in_placeholders(names)})")
         params.extend(names)
     if addresses:
-        identity.append(f"r.ip IN ({_in_placeholders(addresses)})")
+        identity.append(f"r.ip IN ({in_placeholders(addresses)})")
         params.extend(addresses)
     if not identity:
         return []
@@ -1183,23 +1210,33 @@ def _target_rows():
 
 
 def _load_target(target_id):
-    """The whole ds_targets row, or None."""
+    """The whole ds_targets row, or None.
+
+    v1.1.3 - a database failure is None too (logged by class name), the same answer a missing target gets, so
+    toggle, delete, preview, the records list and the export answer with their own "not found" instead of a 500."""
     db = None
     try:
         db = _get_db()
         with db.cursor() as cur:
             cur.execute("SELECT * FROM ds_targets WHERE id=%s", (target_id,))
             return cur.fetchone()
+    except Exception as e:
+        logger.error(f"DNS Sync: could not load target {target_id}: {type(e).__name__}")
+        return None
     finally:
         if db:
             db.close()
 
 
 def _visible_records(target_id):
-    """The ledger rows of a target that the session user may see. A record's subnet is where
-    its IP actually lives; one that lives in no known subnet belongs to unrestricted users only."""
+    """The ledger rows of a target that the session user may see, or None when the ledger could not be read.
+    A record's subnet is where its IP actually lives; one that lives in no known subnet belongs to
+    unrestricted users only."""
     subnet_map = _subnet_map()
-    _ledger, rows = _ledger_for_target(target_id)
+    ledger_read = _ledger_for_target(target_id)
+    if ledger_read is None:
+        return None
+    _ledger, rows = ledger_read
     return [r for r in rows if _can(_derive_subnet_id(r["ip"], subnet_map))]
 
 
@@ -1216,7 +1253,7 @@ def _visible_record_counts(target_ids, subnet_map):
         db = _get_db()
         with db.cursor() as cur:
             cur.execute(
-                f"SELECT target_id, ip FROM ds_records WHERE target_id IN ({_in_placeholders(target_ids)})",  # nosec B608 - only `%s` placeholders are interpolated; every value is bound
+                f"SELECT target_id, ip FROM ds_records WHERE target_id IN ({in_placeholders(target_ids)})",  # nosec B608 - only `%s` placeholders are interpolated; every value is bound
                 tuple(target_ids),
             )
             for row in cur.fetchall():
@@ -1249,6 +1286,7 @@ def index():
         if not target_visible(ids, _can):
             continue
         r["can_manage"] = target_manageable(ids, _can)
+        r["url"] = display_url(r.get("url"))  # a URL saved before 1.1.3 may carry user:pass@ - never printed
         visible.append(r)
     counts = _visible_record_counts([r["id"] for r in visible], subnet_map)
     rows = []
@@ -1259,7 +1297,7 @@ def index():
     accessible_subnets = [
         {"id": sid, "name": subnet_map.get(sid, {}).get("name") or f"subnet {sid}"} for sid in sorted(accessible)
     ]
-    admin = _is_admin()
+    admin = is_admin_or_above()
     return render_template(
         "dns_sync/index.html",
         rows=rows,
@@ -1273,9 +1311,8 @@ def index():
 
 @bp.route("/targets/add", methods=["POST"])
 @login_required
+@require_write(_VIEWER_MESSAGE, "dns_sync.index")
 def add_target():
-    if not _require_write():
-        return redirect(url_for("dns_sync.index"))
     if not _all_subnets_user():
         # A target holds the DNS server's credential and applies to a whole set of subnets, so it is
         # global integration configuration: only an account that can see every subnet may create one.
@@ -1290,6 +1327,11 @@ def add_target():
     url = request.form.get("url", "").strip().rstrip("/")
     if not url.startswith(("http://", "https://")):
         flash("URL must start with http:// or https://.", "error")
+        return redirect(url_for("dns_sync.index"))
+    if url_has_userinfo(url):
+        # Refused, not stripped: silently dropping it would save a target that cannot log in, and echoing it
+        # (the URL, the password) back would repeat the very secret the field is not for.
+        flash("The URL cannot contain a username or password; enter the credential in the password field.", "error")
         return redirect(url_for("dns_sync.index"))
     domain, domain_error = normalize_domain(request.form.get("domain", "lan"))
     if domain is None:
@@ -1353,8 +1395,10 @@ def add_target():
 @bp.route("/targets/<int:target_id>/preview", methods=["POST"])
 @login_required
 def preview_target(target_id):
-    if not _require_write():
-        return jsonify({"error": "forbidden"}), 403
+    if not is_admin_or_above():
+        # A JSON answer, never a flash: the page's script reads this response, and a flash queued on it would
+        # show up on whatever page the person opens next. (`require_write` flashes for a non-JSON request.)
+        return jsonify({"ok": False, "error": _VIEWER_MESSAGE}), 403
     target = _reachable_target(target_id)
     if not target:
         return jsonify({"error": "not found"}), 404
@@ -1396,9 +1440,8 @@ def preview_target(target_id):
 
 @bp.route("/targets/<int:target_id>/toggle", methods=["POST"])
 @login_required
+@require_write(_VIEWER_MESSAGE, "dns_sync.index")
 def toggle_target(target_id):
-    if not _require_write():
-        return redirect(url_for("dns_sync.index"))
     row = _reachable_target(target_id)
     if row is None:
         flash("Target not found.", "error")
@@ -1430,9 +1473,8 @@ def toggle_target(target_id):
 
 @bp.route("/targets/<int:target_id>/delete", methods=["POST"])
 @login_required
+@require_write(_VIEWER_MESSAGE, "dns_sync.index")
 def delete_target(target_id):
-    if not _require_write():
-        return redirect(url_for("dns_sync.index"))
     if not _all_subnets_user():
         flash("Removing a DNS Sync target needs an account that can see every subnet.", "error")
         return redirect(url_for("dns_sync.index"))
@@ -1462,7 +1504,10 @@ def delete_target(target_id):
 def target_records(target_id):
     if _reachable_target(target_id) is None:
         return jsonify({"error": "not found"}), 404
-    rows = [{"name": r["name"], "ip": r["ip"], "source": r["source"]} for r in _visible_records(target_id)]
+    visible = _visible_records(target_id)
+    if visible is None:
+        return jsonify({"error": "the records could not be read"}), 503
+    rows = [{"name": r["name"], "ip": r["ip"], "source": r["source"]} for r in visible]
     return jsonify({"rows": rows})
 
 
@@ -1474,7 +1519,10 @@ def export_unbound(target_id):
         return Response("Target not found.", status=404, mimetype="text/plain")
     # The same per-record filter the record list applies: an export of the whole ledger would hand
     # a subnet-restricted user the names and addresses of hosts in subnets they cannot see.
-    records = {r["name"]: r["ip"] for r in _visible_records(target_id)}
+    visible = _visible_records(target_id)
+    if visible is None:
+        return Response("The records could not be read.", status=503, mimetype="text/plain")
+    records = {r["name"]: r["ip"] for r in visible}
     body = unbound_export(records, target["domain"])
     return Response(
         body,

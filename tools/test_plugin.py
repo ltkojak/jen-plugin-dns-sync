@@ -9,6 +9,7 @@ plugin with hand-built inputs.
 Run: `python3 tools/test_plugin.py` (exit 1 on the first failing check).
 """
 
+import functools
 import importlib.util
 import os
 import sys
@@ -42,6 +43,41 @@ def _stub_modules():
     fl.current_user = types.SimpleNamespace(username="tester", all_subnets=True, role="admin")
     fl.login_required = lambda fn: fn
     sys.modules["flask_login"] = fl
+
+    # plugin.py imports `require_write` / `is_admin_or_above` / `in_placeholders` from jen.plugin_api at the
+    # top (a decorator has to exist when the route is defined), so a stub is installed before it loads. The
+    # gate is Jen's real one in shape (jen/services/plugin_helpers.py::require_write): an admin passes, a
+    # JSON or /api/ request gets a 403 body, anything else a flash and a redirect. What it did is recorded
+    # in GATE_CALLS so a check can see that a refusal flashed (a page) or did not (JSON).
+    api = types.ModuleType("jen.plugin_api")
+
+    def is_admin_or_above():
+        return fl.current_user.role in ("superadmin", "admin")
+
+    def require_write(message="Viewers can look at this but not change it.", redirect_endpoint="dashboard.dashboard"):
+        def deco(fn):
+            @functools.wraps(fn)
+            def wrapped(*args, **kwargs):
+                if is_admin_or_above():
+                    return fn(*args, **kwargs)
+                req = flask.request
+                if req is not None and (req.is_json or req.path.startswith("/api/")):
+                    GATE_CALLS.append(("json", message))
+                    return ({"error": message}, 403)
+                GATE_CALLS.append(("flash", message))
+                return ("gate-redirect", redirect_endpoint)
+
+            return wrapped
+
+        return deco
+
+    api.is_admin_or_above = is_admin_or_above
+    api.require_write = require_write
+    api.in_placeholders = lambda values: ",".join(["%s"] * len(list(values))) if list(values) else "NULL"
+    jen_pkg = types.ModuleType("jen")
+    jen_pkg.plugin_api = api
+    sys.modules["jen"] = jen_pkg
+    sys.modules["jen.plugin_api"] = api
 
 
 def load_plugin():
@@ -91,6 +127,7 @@ def _stub_jen_plugin_api():
 
 failures = []
 INVESTIGATION_CALLS = []  # every register_investigation_provider() call
+GATE_CALLS = []  # what the stub require_write refused, and how: ("flash", message) or ("json", message)
 
 
 def check(cond, msg):
@@ -265,21 +302,31 @@ def main():
 
     # ── write gate — viewers can look at DNS Sync but not change it ─────────
     p.current_user.role = "viewer"
-    check(p._is_admin() is False, "a viewer is not admin")
-    check(p._require_write() is False, "a viewer cannot write")
+    check(p.is_admin_or_above() is False, "a viewer is not admin")
     for fn, args in (
         (p.add_target, ()),
         (p.toggle_target, (1,)),
         (p.delete_target, (1,)),
     ):
+        GATE_CALLS.clear()
         try:
-            fn(*args)
+            answer = fn(*args)
             gated = True
         except Exception:
-            gated = False
-        check(gated, f"{fn.__name__} refuses a viewer before touching the request")
+            answer, gated = None, False
+        check(
+            gated and answer == ("gate-redirect", "dns_sync.index") and GATE_CALLS == [("flash", p._VIEWER_MESSAGE)],
+            f"{fn.__name__} refuses a viewer before touching the request (plugin_api.require_write: flash + redirect)",
+        )
+    # 1.1.3 - the one JSON route that used to flash on a role refusal answers JSON and flashes nothing
+    GATE_CALLS.clear()
+    p.jsonify = lambda payload: payload
+    check(
+        p.preview_target(1) == ({"ok": False, "error": p._VIEWER_MESSAGE}, 403) and GATE_CALLS == [],
+        "preview_target refuses a viewer with a 403 JSON body and queues no flash",
+    )
     p.current_user.role = "admin"
-    check(p._is_admin() is True, "admin role restored for the rest of the run")
+    check(p.is_admin_or_above() is True, "admin role restored for the rest of the run")
 
     # ── 1.0.2: the domain suffix is validated as DNS labels ──────────────────
     check(p.normalize_domain("") == ("lan", None), "normalize_domain: blank is the default `lan`")
@@ -486,7 +533,6 @@ def main():
     check(ran == [4, 5], "_sync_one_target: a lock on one target never holds up another")
 
     # ── 1.0.2: who may do what to a target (the routes, restricted callers) ──
-    p._require_write = lambda: True
     p.flash = lambda msg, cat="message": flashed.append(msg)
     p.redirect = lambda where: "redirect"
     p.url_for = lambda *a, **k: "/"
@@ -576,7 +622,6 @@ def main():
 
     flashed.clear()
     p._can = everything
-    p._require_write = lambda: True
     p._accessible_subnets = lambda: {1: {}}
     p._get_db = db_down
     p.request = types.SimpleNamespace(
@@ -765,10 +810,10 @@ def main():
     check(rows and rows[0]["hostname"] == "nas", "_leases_for_subnets: the rows come back unchanged")
 
     # ── 1.1.2: the failure alert has no subnet, so it is sent scoped=True: a channel limited to some subnets never receives it ──
-    _stub_jen_plugin_api()
+    r = load_plugin()  # an untouched copy: p._maybe_alert was replaced by a recorder above
+    _stub_jen_plugin_api()  # after the load: load_plugin() installs its own early jen.plugin_api stub
     sent_alerts = []
     sys.modules["jen.plugin_api"].send_alert = lambda alert_type, **kw: sent_alerts.append((alert_type, kw))
-    r = load_plugin()  # an untouched copy: p._maybe_alert was replaced by a recorder above
     stamps = FakeDB()
     r._get_db = lambda: stamps
     r._maybe_alert(
@@ -797,6 +842,149 @@ def main():
         "x",
     )
     check(sent_alerts == [], "_maybe_alert: inside the cooldown nothing is sent, scoped or not")
+
+    # ── 1.1.3: a target URL never carries user:pass@ - refused on save, never printed ──
+    t = load_plugin()
+    for with_userinfo in (
+        "http://admin:s3cret@pi.hole",
+        "https://admin@pi.hole:8443/admin",
+        "http://a:b@[::1]:80/x",
+        "http://pi.hole@evil.example",
+    ):
+        check(t.url_has_userinfo(with_userinfo) is True, f"url_has_userinfo: {with_userinfo!r} carries userinfo")
+    for clean in (
+        "http://pi.hole",
+        "https://pi.hole:8443/admin",
+        "http://[::1]:80/",
+        "http://pi.hole/a@b",
+        "http://pi.hole/?q=a@b",
+    ):
+        check(
+            t.url_has_userinfo(clean) is False, f"url_has_userinfo: {clean!r} does not (an @ after the host is a path)"
+        )
+        check(t.display_url(clean) == clean, f"display_url: {clean!r} is shown unchanged")
+    check(
+        t.display_url("http://admin:s3cret@pi.hole:8080/admin?x=1") == "http://pi.hole:8080/admin?x=1",
+        "display_url: userinfo is removed, host/port/path/query kept",
+    )
+    check(
+        t.display_url("https://a@b@pi.hole") == "https://pi.hole",
+        "display_url: everything up to the LAST @ in the authority is userinfo",
+    )
+    check(t.display_url(None) == "" or t.display_url(None) is None, "display_url: a missing URL does not raise")
+
+    saved = []
+    t._can = everything
+    t._accessible_subnets = lambda: {1: {}}
+    t._get_db = lambda: (_ for _ in ()).throw(AssertionError("the database was touched"))
+    t.flash = lambda msg, cat="message": saved.append(msg)
+    t.redirect = lambda where: "redirect"
+    t.url_for = lambda *a, **k: "/"
+    t.request = types.SimpleNamespace(
+        form=_Form(
+            {
+                "name": "x",
+                "kind": "pihole",
+                "url": "http://admin:s3cret@pi.hole",
+                "domain": "lan",
+                "sources": "leases",
+                "scope_all": "on",
+            }
+        ),
+        args={},
+    )
+    check(t.add_target() == "redirect", "add_target: a URL with userinfo is refused (redirect, nothing saved)")
+    check(
+        len(saved) == 1
+        and "password field" in saved[0]
+        and all(secret not in saved[0] for secret in ("s3cret", "admin", "pi.hole", "http")),
+        f"add_target: the refusal tells the person where the credential goes and echoes neither URL nor password (got {saved})",
+    )
+    t._target_rows = lambda: [
+        {
+            "id": 1,
+            "name": "a",
+            "kind": "pihole",
+            "url": "http://admin:s3cret@pi.hole",
+            "subnet_ids": "[1]",
+            "sources": "leases",
+        },
+        {
+            "id": 2,
+            "name": "b",
+            "kind": "adguard",
+            "url": "http://ag.lan:3000",
+            "subnet_ids": "[1]",
+            "sources": "leases",
+        },
+    ]
+    t._subnet_map = lambda: {1: {"name": "lan", "cidr": "10.0.0.0/24"}}
+    t._visible_record_counts = lambda ids, smap: dict.fromkeys(ids, 0)
+    t.render_template = lambda name, **kw: kw
+    page = t.index()
+    check(
+        [r["url"] for r in page["rows"]] == ["http://pi.hole", "http://ag.lan:3000"],
+        f"index: a stored URL with userinfo is shown without it (got {[r['url'] for r in page['rows']]})",
+    )
+
+    # ── 1.1.3: a database failure in a loader helper is an answer, not a 500 ──
+    class _Boom(Exception):
+        pass
+
+    def boom_db():
+        raise _Boom("Access denied for user 'jen'@'10.9.9.9' marker-q174")
+
+    import logging
+
+    class _Capture(logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.lines = []
+
+        def emit(self, record):
+            self.lines.append(record.getMessage())
+
+    capture = _Capture()
+    t.logger.addHandler(capture)
+    t._get_db = boom_db
+    check(t._load_target(9) is None, "_load_target: a database failure reads as 'no such target', not a raised error")
+    check(t._ledger_for_target(9) is None, "_ledger_for_target: a database failure is None, never an empty ledger")
+    check(
+        capture.lines
+        and all("marker-q174" not in m and "10.9.9.9" not in m for m in capture.lines)
+        and any("_Boom" in m for m in capture.lines),
+        f"the loaders log the failure by class name only (got {capture.lines})",
+    )
+    t.logger.removeHandler(capture)
+    nothing, _d, _s, ledger, _sk, why = t._plan_for_target({"id": 9, "subnet_ids": "[]", "sources": ""})
+    check(
+        nothing == {"add": [], "update": [], "remove": []} and ledger == {} and "ledger could not be read" in why,
+        "_plan_for_target: an unreadable ledger plans nothing and says so (a sync stops on it; Preview shows it)",
+    )
+    t.jsonify = lambda payload: payload
+    t.Response = lambda body, status=200, **k: (body, status)
+    t._load_target = lambda tid: {"id": 9, "subnet_ids": "[1]", "enabled": 1, "previewed_at": "x", "domain": "lan"}
+    t._ledger_for_target = lambda tid: None
+    check(
+        t.target_records(9) == ({"error": "the records could not be read"}, 503),
+        "records: an unreadable ledger is a 503, not a list that claims there are none",
+    )
+    check(
+        t.export_unbound(9) == ("The records could not be read.", 503),
+        "export: an unreadable ledger is a 503, not an empty export",
+    )
+    t2 = load_plugin()  # an untouched copy: `t` shadowed its real _load_target above
+    saved.clear()
+    t2._can = everything
+    t2.flash = lambda msg, cat="message": saved.append(msg)
+    t2.redirect = lambda where: "redirect"
+    t2.url_for = lambda *a, **k: "/"
+    t2._get_db = boom_db
+    check(
+        t2.toggle_target(9) == "redirect" and saved == ["Target not found."],
+        f"toggle: a database failure while loading the target answers the plain not-found, no exception text (got {saved})",
+    )
+    check(t2.delete_target(9) == "redirect" and saved[-1] == "Target not found.", "delete: likewise")
 
     if failures:
         print(f"\n{len(failures)} check(s) failed")

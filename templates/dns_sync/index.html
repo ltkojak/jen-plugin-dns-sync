@@ -222,6 +222,9 @@ document.querySelectorAll('.ds-preview-btn').forEach(function(btn) {
                 section('Add', d.add, function(it) { return escapeHtml(it[0]) + ' → ' + escapeHtml(it[1]); });
                 section('Update', d.update, function(it) { return escapeHtml(it[0]) + ' → ' + escapeHtml(it[1]); });
                 section('Remove', d.remove, function(it) { return escapeHtml(it); });
+                if (d.present && d.present.length) {
+                    section('Already on the server, left alone', d.present, function(it) { return escapeHtml(it[0]) + ' → ' + escapeHtml(it[1]); });
+                }
                 if (d.skipped && d.skipped.length) {
                     html += '<h4>Skipped (' + d.skipped.length + ')</h4><ul>';
                     d.skipped.forEach(function(s) {

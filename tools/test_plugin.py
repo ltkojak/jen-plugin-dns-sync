@@ -213,7 +213,7 @@ def main():
     plan = p.plan_sync(
         desired={"nas": "10.0.0.5", "printer": "10.0.0.9"},
         ledger={"nas": "10.0.0.5", "old-host": "10.0.0.1"},
-        remote={"nas": "10.0.0.5", "someone-elses-record": "10.0.0.77"},
+        remote={("nas", "10.0.0.5"), ("someone-elses-record", "10.0.0.77")},
     )
     check(
         plan["add"] == [("printer", "10.0.0.9")],
@@ -227,13 +227,113 @@ def main():
         "someone-elses-record" not in plan["remove"],
         "plan_sync: THE INVARIANT — a foreign record in `remote` but not `ledger` is never proposed for removal",
     )
-    ip_changed = p.plan_sync(desired={"nas": "10.0.0.6"}, ledger={"nas": "10.0.0.5"}, remote={"nas": "10.0.0.5"})
+    ip_changed = p.plan_sync(desired={"nas": "10.0.0.6"}, ledger={"nas": "10.0.0.5"}, remote={("nas", "10.0.0.5")})
     check(ip_changed["update"] == [("nas", "10.0.0.6")], "plan_sync: a changed ip for an existing name is an update")
-    drifted = p.plan_sync(desired={"nas": "10.0.0.5"}, ledger={"nas": "10.0.0.5"}, remote={})
+    drifted = p.plan_sync(desired={"nas": "10.0.0.5"}, ledger={"nas": "10.0.0.5"}, remote=set())
     check(
         drifted["update"] == [("nas", "10.0.0.5")],
         "plan_sync: ledger matches desired but the remote record vanished -> re-propose as an update",
     )
+
+    # ── 1.1.4 (DS-1): a wanted pair that is already on the server and not in the ledger is somebody's own ──
+    class Server:
+        """AdGuard Home's two calls as its source has them: add appends without a duplicate check, delete drops EVERY equal entry."""
+
+        def __init__(self, entries):
+            self.entries = list(entries)
+
+        def add(self, name, ip):
+            self.entries.append((name, ip))
+
+        def remove(self, name, ip):
+            self.entries = [e for e in self.entries if e != (name, ip)]
+
+    def old_plan_sync(desired, ledger, remote):
+        # the 1.1.3 planner, written out: the control for the two checks below
+        by_name = dict(remote)
+        add, update = [], []
+        for name, ip in desired.items():
+            if name not in ledger:
+                add.append((name, ip))
+            elif ledger[name] != ip or by_name.get(name) != ip:
+                update.append((name, ip))
+        return {"add": add, "update": update, "remove": [n for n in ledger if n not in desired], "present": []}
+
+    def lease_comes_and_goes(planner):
+        server, ledger = Server([("nas", "10.0.0.5")]), {}
+        for desired in ({"nas": "10.0.0.5"}, {}):
+            plan = planner(desired, ledger, set(server.entries))
+            ups, rems, _errs = p.apply_plan(plan, ledger, {}, server.add, server.remove)
+            for name in rems:
+                ledger.pop(name, None)
+            for name, ip, _source in ups:
+                ledger[name] = ip
+        return server.entries
+
+    check(
+        lease_comes_and_goes(p.plan_sync) == [("nas", "10.0.0.5")],
+        "plan_sync (DS-1): a hand-made record Jen also wanted is still on the server after the lease came and went",
+    )
+    check(
+        lease_comes_and_goes(old_plan_sync) == [],
+        "plan_sync (DS-1), the control: the 1.1.3 planner adds the hand-made record to the ledger and then deletes it",
+    )
+    already = p.plan_sync(desired={"nas": "10.0.0.5"}, ledger={}, remote={("nas", "10.0.0.5")})
+    check(
+        already == {"add": [], "update": [], "remove": [], "present": [("nas", "10.0.0.5")]},
+        f"plan_sync (DS-1): the pair is reported as present and is in no list that is applied or ledgered (got {already})",
+    )
+    moved_onto = p.plan_sync(
+        desired={"nas": "10.0.0.6"}, ledger={"nas": "10.0.0.5"}, remote={("nas", "10.0.0.5"), ("nas", "10.0.0.6")}
+    )
+    check(
+        moved_onto == {"add": [], "update": [], "remove": ["nas"], "present": [("nas", "10.0.0.6")]},
+        f"plan_sync (DS-1): the new address is already there by someone else's hand -> Jen removes its own old record only (got {moved_onto})",
+    )
+    server = Server([("nas", "10.0.0.5"), ("nas", "10.0.0.6")])
+    ups, rems, errs = p.apply_plan(moved_onto, {"nas": "10.0.0.5"}, {}, server.add, server.remove)
+    check(
+        server.entries == [("nas", "10.0.0.6")] and ups == [] and rems == ["nas"] and not errs,
+        f"apply_plan (DS-1): that plan removes Jen's old record, adds nothing and ledgers nothing (got {server.entries}, {ups}, {rems})",
+    )
+
+    # ── 1.1.4 (DS-7): a second record for a name Jen manages is not Jen's record having changed ──
+    second = p.plan_sync(
+        desired={"nas": "10.0.0.5"}, ledger={"nas": "10.0.0.5"}, remote={("nas", "10.0.0.5"), ("nas", "10.0.0.9")}
+    )
+    check(
+        second == {"add": [], "update": [], "remove": [], "present": []},
+        f"plan_sync (DS-7): a hand-made second address for the name plans nothing (got {second})",
+    )
+    check(
+        old_plan_sync({"nas": "10.0.0.5"}, {"nas": "10.0.0.5"}, [("nas", "10.0.0.5"), ("nas", "10.0.0.9")])["update"]
+        == [("nas", "10.0.0.5")],
+        "plan_sync (DS-7), the control: read as one address per name, the last one winning, it is an update on every sync",
+    )
+    real_http_call = p._http_call
+    p._http_call = lambda method, url, **kw: (
+        200,
+        {"config": {"dns": {"hosts": ["10.0.0.5 nas", "10.0.0.9 nas", "junk"]}}},
+    )
+    got = p._pihole_fetch_remote({"url": "http://pi", "allow_self_signed": 0}, None)
+    check(
+        got == {("nas", "10.0.0.5"), ("nas", "10.0.0.9")},
+        f"_pihole_fetch_remote (DS-7): two lines for one name are two pairs (got {got})",
+    )
+    p._http_call = lambda method, url, **kw: (
+        200,
+        [
+            {"domain": "nas.lan", "answer": "10.0.0.5"},
+            {"domain": "nas.lan", "answer": "fd00::5"},
+            {"domain": "elsewhere.example", "answer": "10.0.0.7"},
+        ],
+    )
+    got = p._adguard_fetch_remote({"url": "http://ag", "domain": "lan", "allow_self_signed": 0, "credential": ""})
+    check(
+        got == {("nas", "10.0.0.5"), ("nas", "fd00::5")},
+        f"_adguard_fetch_remote (DS-7): two rewrites for one name are two pairs, another domain is not listed (got {got})",
+    )
+    p._http_call = real_http_call
 
     # ── Pi-hole hosts-line parser ─────────────────────────────────────────────
     check(
@@ -379,7 +479,7 @@ def main():
 
     remote = Remote({("nas", "10.0.0.5"), ("foreign", "10.0.0.77")})
     ledger = {"nas": "10.0.0.5"}
-    plan = p.plan_sync({"nas": "10.0.0.6"}, ledger, {"nas": "10.0.0.5", "foreign": "10.0.0.77"})
+    plan = p.plan_sync({"nas": "10.0.0.6"}, ledger, {("nas", "10.0.0.5"), ("foreign", "10.0.0.77")})
     ups, rems, errs = p.apply_plan(plan, ledger, {"nas": "reservation"}, remote.add, remote.remove)
     check(
         remote.lines == {("nas", "10.0.0.6"), ("foreign", "10.0.0.77")},
@@ -408,7 +508,7 @@ def main():
     )
 
     remote = Remote({("old", "10.0.0.1"), ("foreign", "10.0.0.9")})
-    plan = p.plan_sync({}, {"old": "10.0.0.1"}, {"old": "10.0.0.1", "foreign": "10.0.0.9"})
+    plan = p.plan_sync({}, {"old": "10.0.0.1"}, {("old", "10.0.0.1"), ("foreign", "10.0.0.9")})
     ups, rems, errs = p.apply_plan(plan, {"old": "10.0.0.1"}, {}, remote.add, remote.remove)
     check(
         remote.lines == {("foreign", "10.0.0.9")} and rems == ["old"],
@@ -958,7 +1058,9 @@ def main():
     t.logger.removeHandler(capture)
     nothing, _d, _s, ledger, _sk, why = t._plan_for_target({"id": 9, "subnet_ids": "[]", "sources": ""})
     check(
-        nothing == {"add": [], "update": [], "remove": []} and ledger == {} and "ledger could not be read" in why,
+        nothing == {"add": [], "update": [], "remove": [], "present": []}
+        and ledger == {}
+        and "ledger could not be read" in why,
         "_plan_for_target: an unreadable ledger plans nothing and says so (a sync stops on it; Preview shows it)",
     )
     t.jsonify = lambda payload: payload

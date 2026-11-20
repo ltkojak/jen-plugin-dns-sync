@@ -1,5 +1,25 @@
 # Local DNS Sync Plugin — Changelog
 
+## [1.1.4] - 2026-11-20
+
+Two fixes to the planner, from the plugin audit for Jen 7.2.0 (DS-1, DS-7). `requires_jen` stays 5.68.0. No migration.
+
+### Fixed: a record you made by hand could be deleted when Jen wanted the same one (DS-1)
+
+DNS Sync removes only records that are in its own ledger. That held for a removal and not for an add. When the server already had a record you made yourself, say `nas.lan` at 10.0.0.5, and a lease or reservation later asked for exactly that name and address, the plan was "add". AdGuard Home accepts a duplicate and answers 200, so the name went into the ledger as if Jen had created it. When the lease ended the plan was "remove", and AdGuard Home's delete drops every entry with that domain and answer: your own record went with it. On Pi-hole the same add is refused as a duplicate, so that target reported an error on every sync and sent the failure alert every hour.
+
+A wanted name and address that are already on the server, and that the ledger does not hold, are now left alone: not added, not put in the ledger, and so never removed by Jen. Preview lists them under **Already on the server, left alone**. When the ledger holds the name at an older address, Jen removes its own old record and leaves the one on the server alone.
+
+This does not go back and repair a ledger that already claims such a record. If a target's ledger was built while this bug was live, a record of yours that matched may be in it; Jen will still treat that record as its own.
+
+### Fixed: a second record for a name Jen manages caused an update on every sync (DS-7)
+
+The server's list was read as one address per name, the last one winning. A second record for the same name, made by hand or of a different type, made Jen's own record look changed, so every sync planned an update; on Pi-hole that update was refused each time, with the error and the hourly alert. The list is now read as pairs of name and address, and Jen's record is "there" when its own pair is.
+
+### The harness
+
+`tools/test_plugin.py` runs the planner on both cases, runs both list readers against a stubbed HTTP call with two records for one name, and carries a control: the 1.1.3 planner, written out in the harness, adds the hand-made record and then removes it.
+
 ## [1.1.3] - 2026-10-12
 
 Fix and tidy-up from a whole-tree review of Jen's bundled plugins. `requires_jen` stays 5.68.0 (everything this release imports from `jen.plugin_api` is in 5.68.0 and earlier).

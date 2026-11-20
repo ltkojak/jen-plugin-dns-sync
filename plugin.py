@@ -64,7 +64,11 @@ Design notes
 `plan_sync()` below only ever proposes removing a name that is IN THE
 LEDGER. A record on the remote server that Jen did not create is never
 touched, even if it's absent from the desired set and even if the
-remote list is fetched and inspected for drift detection.
+remote list is fetched and inspected for drift detection. Since 1.1.4
+the same holds for an add: a wanted name and address that are already
+on the server, and that the ledger does not hold, are somebody's own
+record. They are reported as already there, never added and never put
+in the ledger, so a later removal cannot reach them.
 
 **Debounce.** `debounce_schedule`/`debounce_ready` model "a touch
 pushes a target's fire time `delay_s` out" — repeated touches during a
@@ -230,22 +234,42 @@ def normalize_desired(raw_desired):
 
 
 def plan_sync(desired, ledger, remote):
-    """Pure. `desired`/`ledger`/`remote` are all `{name: ip}`. Returns
-    `{"add": [(name, ip)], "update": [(name, ip)], "remove": [name]}`.
+    """Pure. `desired` and `ledger` are `{name: ip}`; `remote` is the SET of
+    `(name, ip)` pairs the server holds (a name may have several records).
+    Returns `{"add": [(name, ip)], "update": [(name, ip)], "remove": [name],
+    "present": [(name, ip)]}`.
 
     The foreign-record invariant: `remove` is built ONLY from names in
-    `ledger` (Jen's own history for this target) that have fallen out
-    of `desired` — `remote` is never iterated for removals, so a
-    record Jen never created (present in `remote`, absent from
-    `ledger`) can never appear in `remove` no matter what it contains."""
-    add, update = [], []
+    `ledger` (Jen's own history for this target) — `remote` is never
+    iterated for removals, so a record Jen never created (present in
+    `remote`, absent from `ledger`) can never appear in `remove` no matter
+    what it contains.
+
+    v1.1.4 — the same invariant for an ADD. A wanted pair that is already on
+    the server and that the ledger does not hold as that pair was put there
+    by someone else: it is `present`, never added and never written to the
+    ledger. Adding it made the ledger claim a record Jen did not create;
+    AdGuard Home appends a duplicate and later deletes every equal entry, so
+    the removal took the operator's own record with it, and Pi-hole refuses
+    the duplicate on every sync. When the ledger holds the name at an OLDER
+    address, Jen's own old record is removed and the pair on the server is
+    left alone. `remote` as pairs also means a second record somebody made
+    for a name Jen manages is not read as Jen's record having changed."""
+    add, update, remove, present = [], [], [], []
     for name, ip in desired.items():
+        on_server = (name, ip) in remote
         if name not in ledger:
-            add.append((name, ip))
-        elif ledger[name] != ip or remote.get(name) != ip:
+            (present if on_server else add).append((name, ip))
+        elif ledger[name] != ip:
+            if on_server:
+                remove.append(name)
+                present.append((name, ip))
+            else:
+                update.append((name, ip))
+        elif not on_server:
             update.append((name, ip))
-    remove = [name for name in ledger if name not in desired]
-    return {"add": add, "update": update, "remove": remove}
+    remove.extend(name for name in ledger if name not in desired)
+    return {"add": add, "update": update, "remove": remove, "present": present}
 
 
 def parse_pihole_hosts_line(line):
@@ -718,12 +742,12 @@ def _pihole_fetch_remote(target, sid):
     if status != 200:
         raise _SyncError(f"Pi-hole GET hosts failed (HTTP {status})")
     lines = (((parsed or {}).get("config") or {}).get("dns") or {}).get("hosts") or []
-    out = {}
+    out = set()
     for line in lines:
         parsed_line = parse_pihole_hosts_line(line)
         if parsed_line:
             ip, name = parsed_line
-            out[name] = ip
+            out.add((name, ip))
     return out
 
 
@@ -764,11 +788,11 @@ def _adguard_fetch_remote(target):
     if status != 200:
         raise _SyncError(f"AdGuard Home GET rewrite/list failed (HTTP {status})")
     suffix = f".{target['domain']}"
-    out = {}
+    out = set()
     for entry in parsed or []:
         domain = str(entry.get("domain", ""))
         if domain.endswith(suffix):
-            out[domain[: -len(suffix)]] = entry.get("answer", "")
+            out.add((domain[: -len(suffix)], str(entry.get("answer", ""))))
     return out
 
 
@@ -813,7 +837,7 @@ def _apply_remove(target, sid, name, ip):
 def _plan_for_target(target, sid=None, session_error=None):
     """(plan, desired, source_by_name, ledger, skipped, remote_error).
     Fetches the remote list once, on the caller's session. A fetch failure
-    still returns a plan (add-only, `remote` degrades to {}) so PREVIEW can show
+    still returns a plan (add-only, `remote` degrades to an empty set) so PREVIEW can show
     the operator something and say why; a real sync must not act on it —
     `_sync_one_target` aborts when `remote_error` is set."""
     desired, source_by_name, skipped = _desired_for_target(target)
@@ -821,7 +845,7 @@ def _plan_for_target(target, sid=None, session_error=None):
     if ledger_read is None:
         # Nothing is planned against a ledger that could not be read (see `_ledger_for_target`); a sync stops on
         # `remote_error` and a Preview shows it.
-        nothing = {"add": [], "update": [], "remove": []}
+        nothing = {"add": [], "update": [], "remove": [], "present": []}
         return (
             nothing,
             desired,
@@ -831,7 +855,7 @@ def _plan_for_target(target, sid=None, session_error=None):
             "The sync ledger could not be read; the details are in Jen's log.",
         )
     ledger, _rows = ledger_read
-    remote, remote_error = {}, session_error
+    remote, remote_error = set(), session_error
     if session_error is None:
         try:
             remote = _fetch_remote(target, sid)
@@ -1432,6 +1456,7 @@ def preview_target(target_id):
             "add": plan["add"],
             "update": plan["update"],
             "remove": plan["remove"],
+            "present": plan["present"],
             "skipped": [{"ip": ip, "raw": raw, "reason": reason} for ip, raw, reason in skipped],
             "remote_error": remote_error,
         }

@@ -11,7 +11,7 @@ Pushes DHCP names — from active leases, Kea reservations, and [IPAM Lite](http
 
 ## Why a ledger, not a mirror
 
-DNS Sync never treats the remote server's whole record set as something it owns. Every record it creates is written to its own ledger table, and every sync — the debounced event-driven one and the 15-minute reconcile — only ever proposes removing a name that's *in that ledger*. A record you (or anything else) added to Pi-hole or AdGuard by hand is never touched, even if DNS Sync's desired set changes underneath it and even though the remote server's own record list is fetched and compared on every sync (to catch drift, not to decide what's safe to delete).
+DNS Sync never treats the remote server's whole record set as something it owns. Every record it creates is written to its own ledger table, and every sync — the debounced event-driven one and the 15-minute reconcile — only ever proposes removing a name that's *in that ledger*. A record you (or anything else) added to Pi-hole or AdGuard by hand is never touched, even if DNS Sync's desired set changes underneath it and even though the remote server's own record list is fetched and compared on every sync (to catch drift, not to decide what's safe to delete). The same holds for an add: when the name and address Jen wants are already on the server and are not in the ledger, that record is yours. Jen leaves it alone, does not put it in the ledger, and Preview lists it under **Already on the server, left alone**.
 
 ## Who can do what
 

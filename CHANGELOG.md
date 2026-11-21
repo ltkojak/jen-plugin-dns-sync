@@ -1,5 +1,23 @@
 # Local DNS Sync Plugin — Changelog
 
+## [1.1.5] - 2026-11-20
+
+Two fixes to Preview, from the executing pass on Jen 7.2.0-beta.3 (BF5, BF10). What a sync adds, updates and removes is unchanged. `requires_jen` (5.68.0) and `plugin_api` (3) are unchanged, and there is no migration.
+
+### Fixed: Preview shows the address of each record it will remove (BF5)
+
+Since 1.1.4 Preview has a section for records that are already on the server and are left alone. Beside *Already on the server, left alone: nas → 10.0.0.6*, the line *Remove: nas* with no address could be read as the removal of that record. It is the removal of the record Jen made earlier at the older address. Each removal now shows that address, from Jen's own ledger: *Remove: nas → 10.0.0.5*.
+
+### Fixed: Preview says when a record on the server is switched off (BF10)
+
+AdGuard Home lets you switch a rewrite off without deleting it. A rewrite with the wanted name and address that is switched off was listed as already on the server, and nothing told you the name did not resolve. Preview now lists such records under *On the server but switched off there, left alone*, with the sentence that these names do not resolve until the record is switched on or removed on the server.
+
+Jen still adds nothing beside a record that is switched off. A second, equal entry would be removed together with yours when the lease ends, because AdGuard Home's delete removes every equal entry; that is the defect 1.1.4 fixed.
+
+### Documented: a record Jen made and no longer has in its ledger stays on the server (BF2)
+
+1.1.4 decided that a record the ledger does not hold is never removed or taken over. The notes of 1.1.4 gave one side of that, a record you made. The same rule reaches a record Jen made whose ledger row was lost: after a restore of Jen's database from an older backup, or after a ledger write that failed, the record stays on the server when its lease moves or ends, and keeps answering with the old address until you remove it there. The README now says so and says what to do after a restore. Nothing in the code changes.
+
 ## [1.1.4] - 2026-11-20
 
 Two fixes to the planner, from the plugin audit for Jen 7.2.0 (DS-1, DS-7). `requires_jen` stays 5.68.0. No migration.

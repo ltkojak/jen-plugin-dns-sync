@@ -221,9 +221,16 @@ document.querySelectorAll('.ds-preview-btn').forEach(function(btn) {
                 }
                 section('Add', d.add, function(it) { return escapeHtml(it[0]) + ' → ' + escapeHtml(it[1]); });
                 section('Update', d.update, function(it) { return escapeHtml(it[0]) + ' → ' + escapeHtml(it[1]); });
-                section('Remove', d.remove, function(it) { return escapeHtml(it); });
+                section('Remove', d.removals || d.remove, function(it) {
+                    if (!Array.isArray(it)) { return escapeHtml(it); }
+                    return escapeHtml(it[0]) + (it[1] ? ' → ' + escapeHtml(it[1]) : '');
+                });
                 if (d.present && d.present.length) {
                     section('Already on the server, left alone', d.present, function(it) { return escapeHtml(it[0]) + ' → ' + escapeHtml(it[1]); });
+                }
+                if (d.disabled && d.disabled.length) {
+                    section('On the server but switched off there, left alone', d.disabled, function(it) { return escapeHtml(it[0]) + ' → ' + escapeHtml(it[1]); });
+                    html += '<p class="muted">These names do not resolve until the record is switched on or removed on the server. Jen does not add a second record beside one that is switched off.</p>';
                 }
                 if (d.skipped && d.skipped.length) {
                     html += '<h4>Skipped (' + d.skipped.length + ')</h4><ul>';

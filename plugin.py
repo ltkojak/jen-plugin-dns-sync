@@ -777,6 +777,20 @@ def _adguard_auth_header(target):
     return {"Authorization": f"Basic {token}"}
 
 
+class _RemotePairs(set):
+    """The `(name, ip)` pairs a server holds. `disabled` is the subset it holds SWITCHED OFF (AdGuard Home's
+    `enabled: false`), which does not resolve.
+
+    v1.1.5 (BF10) - a rewrite somebody switched off is still on the server, so the planner still leaves it alone: adding
+    Jen's own record beside it would put two equal entries there, and AdGuard Home's delete removes every equal entry,
+    which would take the operator's record with Jen's when the lease ends. What 1.1.4 did not do is SAY so: Preview
+    listed the pair as already on the server while the name answered nothing. Preview now lists it on its own."""
+
+    def __init__(self, pairs=()):
+        super().__init__(pairs)
+        self.disabled = set()
+
+
 def _adguard_fetch_remote(target):
     headers = _adguard_auth_header(target)
     status, parsed = _http_call(
@@ -788,11 +802,14 @@ def _adguard_fetch_remote(target):
     if status != 200:
         raise _SyncError(f"AdGuard Home GET rewrite/list failed (HTTP {status})")
     suffix = f".{target['domain']}"
-    out = set()
+    out = _RemotePairs()
     for entry in parsed or []:
         domain = str(entry.get("domain", ""))
         if domain.endswith(suffix):
-            out.add((domain[: -len(suffix)], str(entry.get("answer", ""))))
+            pair = (domain[: -len(suffix)], str(entry.get("answer", "")))
+            out.add(pair)
+            if entry.get("enabled") is False:
+                out.disabled.add(pair)
     return out
 
 
@@ -862,6 +879,8 @@ def _plan_for_target(target, sid=None, session_error=None):
         except _SyncError as e:
             remote_error = str(e)
     plan = plan_sync(desired, ledger, remote)
+    # v1.1.5 (BF10) - for Preview only: which of the pairs left alone the server holds switched off. Nothing is applied from it.
+    plan["disabled"] = sorted(pair for pair in plan["present"] if pair in getattr(remote, "disabled", ()))
     return plan, desired, source_by_name, ledger, skipped, remote_error
 
 
@@ -1433,9 +1452,9 @@ def preview_target(target_id):
 
     try:
         with _remote_session(target) as sid:
-            plan, _desired, _source_by_name, _ledger, skipped, remote_error = _plan_for_target(target, sid)
+            plan, _desired, _source_by_name, ledger, skipped, remote_error = _plan_for_target(target, sid)
     except _SyncError as e:
-        plan, _desired, _source_by_name, _ledger, skipped, remote_error = _plan_for_target(
+        plan, _desired, _source_by_name, ledger, skipped, remote_error = _plan_for_target(
             target, None, session_error=str(e)
         )
 
@@ -1451,12 +1470,17 @@ def preview_target(target_id):
         if db:
             db.close()
 
+    disabled = plan.get("disabled", [])
     return jsonify(
         {
             "add": plan["add"],
             "update": plan["update"],
             "remove": plan["remove"],
-            "present": plan["present"],
+            # v1.1.5 (BF5) - each removal with the address of the record that goes: Jen's OWN record, from its ledger. Beside
+            # "already on the server, left alone: nas -> 10.0.0.6" a bare "Remove: nas" read as the removal of that record.
+            "removals": [[name, ledger.get(name) or ""] for name in plan["remove"]],
+            "present": [pair for pair in plan["present"] if pair not in disabled],
+            "disabled": disabled,
             "skipped": [{"ip": ip, "raw": raw, "reason": reason} for ip, raw, reason in skipped],
             "remote_error": remote_error,
         }

@@ -12,6 +12,7 @@ Run: `python3 tools/test_plugin.py` (exit 1 on the first failing check).
 import functools
 import importlib.util
 import os
+import pathlib
 import sys
 import types
 from datetime import datetime, timedelta
@@ -1087,6 +1088,71 @@ def main():
         f"toggle: a database failure while loading the target answers the plain not-found, no exception text (got {saved})",
     )
     check(t2.delete_target(9) == "redirect" and saved[-1] == "Target not found.", "delete: likewise")
+
+    # ── 1.1.5 (BF10, BF5): Preview says which record goes, and which record on the server is switched off ────────────
+    d = load_plugin()
+    d._http_call = lambda method, url, **kw: (
+        200,
+        [
+            {"domain": "nas.lan", "answer": "10.0.0.5", "enabled": False},
+            {"domain": "tv.lan", "answer": "10.0.0.6", "enabled": True},
+            {"domain": "old.lan", "answer": "10.0.0.7"},
+        ],
+    )
+    listed = d._adguard_fetch_remote({"url": "http://ag", "domain": "lan", "allow_self_signed": 0, "credential": ""})
+    check(
+        listed == {("nas", "10.0.0.5"), ("tv", "10.0.0.6"), ("old", "10.0.0.7")}
+        and listed.disabled == {("nas", "10.0.0.5")},
+        f"_adguard_fetch_remote (BF10): a rewrite switched off is still a pair on the server, and is marked (got {listed.disabled})",
+    )
+    held = d.plan_sync({"nas": "10.0.0.5"}, {}, listed)
+    check(
+        held == {"add": [], "update": [], "remove": [], "present": [("nas", "10.0.0.5")]},
+        f"plan_sync (BF10): nothing is added beside a record that is switched off (got {held})",
+    )
+    target_row = {"id": 4, "url": "http://ag", "domain": "lan", "kind": "adguard", "allow_self_signed": 0}
+    d._desired_for_target = lambda target: (
+        {"nas": "10.0.0.5", "tv": "10.0.0.9"},
+        {"nas": "leases", "tv": "leases"},
+        [],
+    )
+    d._ledger_for_target = lambda target_id: ({"tv": "10.0.0.6", "gone": "10.0.0.8"}, [])
+    d._fetch_remote = lambda target, sid: listed
+    plan = d._plan_for_target(target_row, None)[0]
+    check(
+        plan["disabled"] == [("nas", "10.0.0.5")] and plan["present"] == [("nas", "10.0.0.5")],
+        f"_plan_for_target (BF10): the plan names the pair left alone that is switched off (got {plan})",
+    )
+
+    class _Session:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, *a):
+            return False
+
+    d.jsonify = lambda payload: payload
+    d.current_user.role = "admin"
+    d._reachable_target = lambda target_id: target_row
+    d._target_subnets = lambda target: []
+    d.target_manageable = lambda subnets, can: True
+    d._remote_session = lambda target: _Session()
+    d._get_db = lambda: FakeDB()
+    shown = d.preview_target(4)
+    check(
+        shown["disabled"] == [("nas", "10.0.0.5")] and shown["present"] == [],
+        f"preview (BF10): a record switched off on the server is listed on its own, not as already there (got {shown})",
+    )
+    check(
+        sorted(shown["removals"]) == [["gone", "10.0.0.8"]] and shown["remove"] == ["gone"],
+        f"preview (BF5): each removal carries the address of Jen's own record that goes (got {shown['removals']})",
+    )
+    dns_page = pathlib.Path(ROOT, "templates", "dns_sync", "index.html").read_text(encoding="utf-8")
+    check(
+        "section('Remove', d.removals || d.remove" in dns_page
+        and "On the server but switched off there, left alone" in dns_page,
+        "index.html: Preview prints the address beside each removal and lists switched-off records on their own",
+    )
 
     if failures:
         print(f"\n{len(failures)} check(s) failed")

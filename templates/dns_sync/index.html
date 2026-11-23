@@ -12,15 +12,25 @@
 .ds-dialog-preview{width:min(560px,94vw);max-height:85vh}
 .ds-dialog-records{width:min(480px,94vw);max-height:80vh}
 .ds-hidden{display:none}
+/* v1.1.6 - the header's words give way before its button does, so the button stays at the right at tablet width */
+.ds-head-text{flex:1 1 300px;min-width:0}
+{% if not rows %}
+/* v1.1.6 - the card of first steps, shown in place of an empty table */
+.first-run h3{font-size:15px;margin-bottom:12px}
+.first-run ol{padding-left:22px}
+.first-run li{margin-bottom:10px;line-height:1.6}
+.first-run li:last-child{margin-bottom:0}
+.first-run .btn{margin-left:8px}
+{% endif %}
 </style>
 
 <div class="page-header flex items-center between wrap gap-3">
-    <div>
+    <div class="ds-head-text">
         <h1>{{ icon("globe", "ico-lg") }} DNS Sync</h1>
         <p>Pushes DHCP names into Pi-hole or AdGuard Home local DNS, so names like <span class="mono small">nas.lan</span> resolve without Kea DDNS.</p>
     </div>
     {% if can_create %}
-    <button id="ds-add-btn" class="btn btn-primary">{{ icon("plus") }} Add Target</button>
+    <button type="button" id="ds-add-btn" class="btn btn-primary ds-add-open">{{ icon("plus") }} Add DNS Server</button>
     {% endif %}
 </div>
 
@@ -28,11 +38,24 @@
 <div class="alert alert-info">{{ icon("info") }} DNS Sync tracks IPv4 addresses only.</div>
 {% endif %}
 
+{% if not rows %}
+{# v1.1.6 - no DNS server yet: the first steps, in place of an empty table #}
+<div class="card first-run">
+    <h3>Getting started</h3>
+    <ol>
+        <li>Add a DNS server: the Pi-hole or AdGuard Home that should answer for your DHCP names.
+            {% if can_create %}<button type="button" class="btn btn-sm btn-primary ds-add-open">{{ icon("plus") }} Add DNS Server</button>
+            {% else %}<span class="muted">Adding a DNS server needs an admin who can see every subnet.</span>{% endif %}</li>
+        <li>Run Preview on it, then enable it: Jen refuses to enable a DNS server that was never previewed, and from then on it syncs about 10 seconds after a lease or reservation changes and in full every 15 minutes.</li>
+        <li>Its alert, "DNS Sync: sync failed", is set under {% if is_admin %}<a href="/settings/alerts">Settings - Alerts</a>{% else %}Settings - Alerts{% endif %}: tick it on a channel that is for every subnet, the only kind that gets it.</li>
+    </ol>
+</div>
+{% else %}
 <div class="card ds-card-flush">
 <div class="table-wrap">
 <table id="ds-table" class="rowlist">
     <thead><tr>
-        <th>Target</th>
+        <th>DNS server</th>
         <th>Status</th>
         <th>Sources</th>
         <th>Records</th>
@@ -80,19 +103,17 @@
         </td>
     </tr>
     {% endfor %}
-    {% if not rows %}
-    <tr><td data-m="full" colspan="6" class="center muted">No targets yet. {% if can_create %}Add one above.{% endif %}</td></tr>
-    {% endif %}
     </tbody>
 </table>
 </div>
 </div>
+{% endif %}
 
 {% if can_create %}
 <div id="ds-add-modal" class="ds-modal">
 <div class="card ds-dialog ds-dialog-add">
     <div class="flex between items-center mb-3">
-        <h3>{{ icon("plus") }} Add Target</h3>
+        <h3>{{ icon("plus") }} Add DNS Server</h3>
         <button id="ds-add-close-btn" class="btn btn-sm btn-secondary" aria-label="Close">{{ icon("x") }}</button>
     </div>
     <form method="POST" action="{{ url_for('dns_sync.add_target') }}" id="ds-add-form">
@@ -143,7 +164,7 @@
             {% endfor %}
         </div>
         <div class="flex gap-2 mt-3">
-            <button type="submit" class="btn btn-primary">Add Target</button>
+            <button type="submit" class="btn btn-primary">Add DNS Server</button>
             <button type="button" id="ds-add-cancel-btn" class="btn btn-secondary">Cancel</button>
         </div>
     </form>
@@ -177,7 +198,10 @@ function _dsModal(id, show) {
 }
 
 {% if can_create %}
-document.getElementById('ds-add-btn').addEventListener('click', function() { _dsModal('ds-add-modal', true); });
+// the header's button and, on a page with no DNS server yet, the one in the first step
+document.querySelectorAll('.ds-add-open').forEach(function(btn) {
+    btn.addEventListener('click', function() { _dsModal('ds-add-modal', true); });
+});
 document.getElementById('ds-add-close-btn').addEventListener('click', function() { _dsModal('ds-add-modal', false); });
 document.getElementById('ds-add-cancel-btn').addEventListener('click', function() { _dsModal('ds-add-modal', false); });
 document.getElementById('ds-add-modal').addEventListener('click', function(e) { if (e.target === this) _dsModal('ds-add-modal', false); });
@@ -239,7 +263,7 @@ document.querySelectorAll('.ds-preview-btn').forEach(function(btn) {
                     });
                     html += '</ul>';
                 }
-                html += '<p class="small muted">Preview recorded — this target can now be enabled.</p>';
+                html += '<p class="small muted">Preview recorded. This DNS server can now be enabled.</p>';
                 body.innerHTML = html;
             })
             .catch(function() { body.textContent = 'Preview failed.'; })
@@ -262,7 +286,7 @@ document.querySelectorAll('.ds-records-link').forEach(function(a) {
             .then(function(d) {
                 if (d && d.failed) { body.textContent = 'The records could not be loaded.'; return; }
                 var rows = (d && d.rows) || [];
-                if (!rows.length) { body.textContent = 'No records for this target yet.'; return; }
+                if (!rows.length) { body.textContent = 'No records for this DNS server yet.'; return; }
                 var html = '<table class="rowlist"><thead><tr><th>Name</th><th>IP</th><th>Source</th></tr></thead><tbody>';
                 rows.forEach(function(r) {
                     html += '<tr><td class="mono">' + escapeHtml(r.name) + '</td><td class="mono">' + escapeHtml(r.ip) +

@@ -1169,8 +1169,8 @@ def investigation_card(records, names, addresses):
             if matches
             else ("its address is not one this client holds" if name_ok else "its name is not one this client has")
         )
-        rows.append({"label": r.get("target_name") or "DNS target", "value": f"{fqdn} -> {r['ip']} ({verdict})"})
-    targets = sorted({r.get("target_name") or "a DNS target" for r in records[:_INVESTIGATION_MAX_RECORDS]})
+        rows.append({"label": r.get("target_name") or "DNS server", "value": f"{fqdn} -> {r['ip']} ({verdict})"})
+    targets = sorted({r.get("target_name") or "a DNS server" for r in records[:_INVESTIGATION_MAX_RECORDS]})
     where = ", ".join(targets)
     if bad:
         summary = (
@@ -1359,7 +1359,7 @@ def add_target():
     if not _all_subnets_user():
         # A target holds the DNS server's credential and applies to a whole set of subnets, so it is
         # global integration configuration: only an account that can see every subnet may create one.
-        flash("Adding a DNS Sync target needs an account that can see every subnet.", "error")
+        flash("Adding a DNS server needs an account that can see every subnet.", "error")
         return redirect(url_for("dns_sync.index"))
 
     name = request.form.get("name", "").strip()[:100]
@@ -1428,7 +1428,7 @@ def add_target():
         _audit("DNSSYNC_ADD_TARGET", name, f"kind={kind} url={url}")
     except Exception as e:
         logger.error(f"DNS Sync: could not add target: {e}")
-        flash("Could not add target; the details are in Jen's log.", "error")
+        flash("Could not add the DNS server; the details are in Jen's log.", "error")
     finally:
         if db:
             db.close()
@@ -1448,7 +1448,7 @@ def preview_target(target_id):
     if not target_manageable(_target_subnets(target), _can):
         # Preview stamps `previewed_at`, which is what lets the target be enabled, so it is a write:
         # it needs the same every-subnet access enabling does.
-        return jsonify({"error": "this target covers subnets you cannot access"}), 403
+        return jsonify({"error": "this DNS server covers subnets you cannot access"}), 403
 
     try:
         with _remote_session(target) as sid:
@@ -1493,13 +1493,13 @@ def preview_target(target_id):
 def toggle_target(target_id):
     row = _reachable_target(target_id)
     if row is None:
-        flash("Target not found.", "error")
+        flash("DNS server not found.", "error")
         return redirect(url_for("dns_sync.index"))
     if not target_manageable(_target_subnets(row), _can):
-        flash("That target covers subnets you cannot access, so you cannot change it.", "error")
+        flash("That DNS server covers subnets you cannot access, so you cannot change it.", "error")
         return redirect(url_for("dns_sync.index"))
     if not row["enabled"] and not row["previewed_at"]:
-        flash("Run Preview before enabling a target for the first time.", "error")
+        flash("Run Preview before enabling a DNS server for the first time.", "error")
         return redirect(url_for("dns_sync.index"))
     new_enabled = 0 if row["enabled"] else 1
     db = None
@@ -1508,12 +1508,12 @@ def toggle_target(target_id):
         with db.cursor() as cur:
             cur.execute("UPDATE ds_targets SET enabled=%s WHERE id=%s", (new_enabled, target_id))
         db.commit()
-        flash("Target enabled." if new_enabled else "Target paused.", "success")
+        flash("DNS server enabled." if new_enabled else "DNS server paused.", "success")
         if new_enabled:
             _touch_target(target_id)
     except Exception as e:
         logger.error(f"DNS Sync: could not update target: {e}")
-        flash("Could not update target; the details are in Jen's log.", "error")
+        flash("Could not update the DNS server; the details are in Jen's log.", "error")
     finally:
         if db:
             db.close()
@@ -1525,10 +1525,10 @@ def toggle_target(target_id):
 @require_write(_VIEWER_MESSAGE, "dns_sync.index")
 def delete_target(target_id):
     if not _all_subnets_user():
-        flash("Removing a DNS Sync target needs an account that can see every subnet.", "error")
+        flash("Removing a DNS server needs an account that can see every subnet.", "error")
         return redirect(url_for("dns_sync.index"))
     if _load_target(target_id) is None:
-        flash("Target not found.", "error")
+        flash("DNS server not found.", "error")
         return redirect(url_for("dns_sync.index"))
     db = None
     try:
@@ -1537,11 +1537,11 @@ def delete_target(target_id):
             cur.execute("DELETE FROM ds_records WHERE target_id=%s", (target_id,))
             cur.execute("DELETE FROM ds_targets WHERE id=%s", (target_id,))
         db.commit()
-        flash("Target removed. Jen does not delete its records from the remote server automatically.", "success")
-        _audit("DNSSYNC_DELETE_TARGET", str(target_id), "target removed")
+        flash("DNS server removed. Jen does not delete its records from the remote server automatically.", "success")
+        _audit("DNSSYNC_DELETE_TARGET", str(target_id), "DNS server removed")
     except Exception as e:
         logger.error(f"DNS Sync: could not remove target: {e}")
-        flash("Could not remove target; the details are in Jen's log.", "error")
+        flash("Could not remove the DNS server; the details are in Jen's log.", "error")
     finally:
         if db:
             db.close()
@@ -1565,7 +1565,7 @@ def target_records(target_id):
 def export_unbound(target_id):
     target = _reachable_target(target_id)
     if target is None:
-        return Response("Target not found.", status=404, mimetype="text/plain")
+        return Response("DNS server not found.", status=404, mimetype="text/plain")
     # The same per-record filter the record list applies: an export of the whole ledger would hand
     # a subnet-restricted user the names and addresses of hosts in subnets they cannot see.
     visible = _visible_records(target_id)
@@ -1590,7 +1590,7 @@ def register(app):
         "dns-sync_failed",
         label="DNS Sync: sync failed",
         icon="triangle-alert",
-        default_template="⚠️ DNS Sync target <b>{name}</b> ({kind}) failed: {error}",
+        default_template="⚠️ DNS Sync: the sync to DNS server <b>{name}</b> ({kind}) failed: {error}",
     )
 
     for kind in _EVENT_KINDS:

@@ -17,24 +17,26 @@ The other side of that rule (since 1.1.4): a record Jen made whose ledger row ha
 
 ## Who can do what
 
-A target is an **all-known object**: it holds the DNS server's credential and pushes the names of every subnet it lists. Acting on it (Preview, Enable, Pause) needs access to *every* one of those subnets; creating and deleting a target is for accounts that can see every subnet; a target that lists no subnet is for those accounts alone. Only *seeing* is scoped: one accessible subnet is enough to see that a target exists, and its record list and Unbound export are filtered record by record by where each address lives. A target you cannot see is answered like one that does not exist. Viewers can look but never change anything.
+A DNS server you add to DNS Sync is an **all-known object**: Jen holds its credential and pushes to it the names of every subnet it lists. Acting on it (Preview, Enable, Pause) needs access to *every* one of those subnets; adding and removing a DNS server is for accounts that can see every subnet; a DNS server that lists no subnet is for those accounts alone. Only *seeing* is scoped: one accessible subnet is enough to see that a DNS server is listed, and its record list and Unbound export are filtered record by record by where each address lives. A DNS server you cannot see is answered like one that does not exist. Viewers can look but never change anything.
+
+What DNS Sync writes records to is called a *DNS server* on the page and in this file since 1.1.6. Earlier versions said *target*, and the route paths (`/network/dns-sync/targets/...`), the `ds_targets` table, the audit actions `DNSSYNC_ADD_TARGET` and `DNSSYNC_DELETE_TARGET` and the lines in Jen's log still do.
 
 ## Mandatory preview
 
-A target starts paused. The **Preview** button runs the full planner — normalise names, resolve collisions, diff against the ledger and the remote server — without applying anything, and shows exactly what would change. Only after a preview has run can a target be enabled; the Enable action refuses otherwise. This isn't a UI nudge — it's enforced by the same route that flips the target live.
+A DNS server starts paused. The **Preview** button runs the full planner — normalise names, resolve collisions, diff against the ledger and the remote server — without applying anything, and shows exactly what would change. Only after a preview has run can a DNS server be enabled; the Enable action refuses otherwise. This isn't a UI nudge — it's enforced by the same route that switches the DNS server on. Until the first DNS server is added, the page shows a *Getting started* card in place of the table: add a DNS server, run Preview and enable it, and where the sync-failed alert is set (Settings - Alerts).
 
 ## Features
 
 - **Three sources**, any combination: active DHCP leases, Kea reservations, IPAM Lite static/planned entries. When more than one source names the same IP differently, a reservation wins over a lease, which wins over an IPAM Lite entry
 - **Name normalisation**: lower-cased, `_` mapped to `-`, anything that still isn't a valid single DNS label is skipped (with a reason, shown in Preview) rather than silently mangled; a name collision between two different IPs gets a deterministic `-2`, `-3`, … suffix by ascending IP order
 - **Event-driven, debounced sync**: a lease or reservation change fires a sync ~10 seconds after the last related event in a burst quiets down, so a DHCP renewal storm doesn't hammer the DNS server with one HTTP call per lease
-- **15-minute full reconcile** independent of events, catching anything a debounced sync missed (a restart mid-burst, a target enabled between events, drift from a manual edit on the remote server)
-- **Per-target scope**: pick specific Kea subnets or "all I can access" (resolved to an explicit list when you save, not re-derived from whoever happens to be logged in when a background sync runs)
-- **TLS verified by default**, with a per-target "allow a self-signed certificate" switch for a Pi-hole or AdGuard install using one
-- Credentials are stored encrypted and never rendered back — the form just shows a password field, blank, every time. A target's URL is plain text and is printed on the page, so a URL that carries `user:pass@` is refused on save (the credential goes in the password field, AdGuard Home as `user:pass`); a target saved by an earlier version with one in its URL is shown without it. Remove such a target and add it again to clear the stored URL itself.
-- **Recorded, not displayed**: `ds_targets.created_by` (the account that added a target) is written for the audit trail and is not shown anywhere on the page; there is no migration to drop it.
-- **On the Investigation page** (Jen 5.68.0): a card under "What else Jen knows" with the records pushed under a client's name or onto its addresses, per target, and whether they match its lease or reservation
-- **Export "Unbound local-data"**: Unbound has no write API, so any target's current ledger can be downloaded as a ready-to-include `local-data:` snippet instead
+- **15-minute full reconcile** independent of events, catching anything a debounced sync missed (a restart mid-burst, a DNS server enabled between events, drift from a manual edit on the remote server)
+- **Scope per DNS server**: pick specific Kea subnets or "all I can access" (resolved to an explicit list when you save, not re-derived from whoever happens to be logged in when a background sync runs)
+- **TLS verified by default**, with an "allow a self-signed certificate" switch per DNS server for a Pi-hole or AdGuard install using one
+- Credentials are stored encrypted and never rendered back — the form just shows a password field, blank, every time. A DNS server's URL is plain text and is printed on the page, so a URL that carries `user:pass@` is refused on save (the credential goes in the password field, AdGuard Home as `user:pass`); a DNS server saved by an earlier version with one in its URL is shown without it. Remove such a DNS server and add it again to clear the stored URL itself.
+- **Recorded, not displayed**: `ds_targets.created_by` (the account that added a DNS server) is written for the audit trail and is not shown anywhere on the page; there is no migration to drop it.
+- **On the Investigation page** (Jen 5.68.0): a card under "What else Jen knows" with the records pushed under a client's name or onto its addresses, per DNS server, and whether they match its lease or reservation
+- **Export "Unbound local-data"**: Unbound has no write API, so any DNS server's current ledger can be downloaded as a ready-to-include `local-data:` snippet instead
 
 ## Installation
 
@@ -46,7 +48,7 @@ To install by hand instead (a checkout without registry access), unzip `plugin.z
 
 `python3 tools/verify.py --build` rebuilds `plugin.zip` deterministically from the tree and runs the same checks CI runs on every push and tag: the zip matches the tree byte-for-byte, no template carries an inline event handler, an inline `style=` attribute, an un-nonce'd `<script>`, or a POST form missing `csrf_token` (Jen's CSP and CSRF protection would silently break the first, third and fourth), `manifest.json`'s version matches the top `CHANGELOG.md` entry, and `plugin.py` compiles and passes ruff. The committed `plugin.zip` is the artifact Jen installs, so rebuild it in the same commit as any change.
 
-`python3 tools/test_plugin.py` exercises every pure function — name normalisation, the collision-suffixing dedupe, the source-priority merge, the planner (including the foreign-record invariant), the Pi-hole hosts-line parser, the Unbound export, and the debounce state machine — plus the applier (an IP change leaves exactly one record), the Pi-hole session, the per-target lock and every by-id route's authorization, against hand-built inputs and fakes, no Jen, database, or network access needed.
+`python3 tools/test_plugin.py` exercises every pure function — name normalisation, the collision-suffixing dedupe, the source-priority merge, the planner (including the foreign-record invariant), the Pi-hole hosts-line parser, the Unbound export, and the debounce state machine — plus the applier (an IP change leaves exactly one record), the Pi-hole session, the lock of each DNS server and every by-id route's authorization, against hand-built inputs and fakes, no Jen, database, or network access needed.
 
 ## API references
 

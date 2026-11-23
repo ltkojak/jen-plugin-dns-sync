@@ -1,5 +1,33 @@
 # Local DNS Sync Plugin — Changelog
 
+## [1.1.6] - 2026-11-22
+
+Words and page polish from the look over the pages of Jen 7.2.0-beta.5. What a sync adds, updates and removes is unchanged. `requires_jen` (5.68.0) and `plugin_api` (3) are unchanged, and there is no migration.
+
+### Changed: what DNS Sync writes records to is called a DNS server (plugin pages differ from each other, V52)
+
+The page's button said *Add Target*, and so did Host Watchdog's, for a different thing: there a target is a host to probe, here it was the Pi-hole or AdGuard Home that records are written to. Neither page said what the word meant. On this page it is now a **DNS server** in everything you read: the header button and the dialog (*Add DNS Server*), the table's first column, the messages after an action (*DNS server enabled.*, *DNS server paused.*, *DNS server removed.*, *DNS server not found.*, *Run Preview before enabling a DNS server for the first time.*), the Preview dialog's last line, the card on the Investigation page, the detail of the audit entry for a removal, and this plugin's README.
+
+The default text of the sync-failed alert changes with it, from *DNS Sync target **name** (kind) failed: error* to *DNS Sync: the sync to DNS server **name** (kind) failed: error*. A template you edited under Settings - Alerts is yours and stays as you wrote it.
+
+What keeps the old word, on purpose: the route paths (`/network/dns-sync/targets/...`), the `ds_targets` table and the `target_id` column, the audit action names `DNSSYNC_ADD_TARGET` and `DNSSYNC_DELETE_TARGET`, and the lines in Jen's log, which name a DNS server by the same number its route path carries (*target 3*). A script or a search of the audit log written against an earlier version keeps working.
+
+### Changed: a page with no DNS server yet shows the first steps (a first-run block on each empty plugin page, addition 11)
+
+On a fresh install the page showed the headings of a table over one line, *No targets yet. Add one above.* Nothing said that a new entry starts paused and has to be previewed before it can be enabled, so the first thing a person met after adding one was the refusal of the Enable button; and nothing said where the alert for a failed sync is switched on.
+
+Until the first DNS server exists the page now shows one card, *Getting started*, in place of the table:
+
+1. Add a DNS server: the Pi-hole or AdGuard Home that should answer for your DHCP names. The step carries its own **Add DNS Server** button, which opens the same dialog as the one in the page header.
+2. Run Preview on it, then enable it: Jen refuses to enable a DNS server that was never previewed, and from then on it syncs about 10 seconds after a lease or reservation changes and in full every 15 minutes.
+3. Its alert, "DNS Sync: sync failed", is set under Settings - Alerts: tick it on a channel that is for every subnet, the only kind that gets it.
+
+An account that may not add a DNS server (a viewer, or an admin limited to some subnets) sees the same card with a sentence in place of the button, and a viewer sees the third step without the link. The table is drawn again as soon as there is a DNS server to show.
+
+### Fixed: the Add button stays at the right of the header on a tablet (V52)
+
+At 768 px the page's one-sentence description filled the row and pushed the button onto a line of its own under it, at the left, while the other plugin pages kept theirs at the top right. The description now wraps before the button moves.
+
 ## [1.1.5] - 2026-11-20
 
 Two fixes to Preview, from the executing pass on Jen 7.2.0-beta.3 (BF5, BF10). What a sync adds, updates and removes is unchanged. `requires_jen` (5.68.0) and `plugin_api` (3) are unchanged, and there is no migration.

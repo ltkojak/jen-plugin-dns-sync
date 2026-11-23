@@ -658,13 +658,13 @@ def main():
         "toggle: a target that reaches an inaccessible subnet cannot be changed (all-known rule)",
     )
     check(
-        p.preview_target(9) == ({"error": "this target covers subnets you cannot access"}, 403),
+        p.preview_target(9) == ({"error": "this DNS server covers subnets you cannot access"}, 403),
         "preview: the same all-known rule, refused with 403 and no stamp",
     )
     p._load_target = lambda tid: row_b
     check(p.preview_target(9) == ({"error": "not found"}, 404), "preview: an invisible target is a 404")
     check(p.target_records(9) == ({"error": "not found"}, 404), "records: an invisible target is a 404")
-    check(p.export_unbound(9) == ("Target not found.", 404), "export: an invisible target is a 404")
+    check(p.export_unbound(9) == ("DNS server not found.", 404), "export: an invisible target is a 404")
     p._load_target = lambda tid: {"id": 9, "subnet_ids": "[1]", "enabled": 0, "previewed_at": "x", "domain": "lan"}
     check(
         p.delete_target(9) == "redirect" and "every subnet" in flashed[-1],
@@ -1084,10 +1084,10 @@ def main():
     t2.url_for = lambda *a, **k: "/"
     t2._get_db = boom_db
     check(
-        t2.toggle_target(9) == "redirect" and saved == ["Target not found."],
+        t2.toggle_target(9) == "redirect" and saved == ["DNS server not found."],
         f"toggle: a database failure while loading the target answers the plain not-found, no exception text (got {saved})",
     )
-    check(t2.delete_target(9) == "redirect" and saved[-1] == "Target not found.", "delete: likewise")
+    check(t2.delete_target(9) == "redirect" and saved[-1] == "DNS server not found.", "delete: likewise")
 
     # ── 1.1.5 (BF10, BF5): Preview says which record goes, and which record on the server is switched off ────────────
     d = load_plugin()
@@ -1152,6 +1152,130 @@ def main():
         "section('Remove', d.removals || d.remove" in dns_page
         and "On the server but switched off there, left alone" in dns_page,
         "index.html: Preview prints the address beside each removal and lists switched-off records on their own",
+    )
+
+    # ── 1.1.6 (V52): what DNS Sync writes to is a DNS server in every sentence a person reads ────────────────────────
+    import ast as _ast
+    import re as _re
+
+    plugin_src = pathlib.Path(ROOT, "plugin.py").read_text(encoding="utf-8")
+    tree = _ast.parse(plugin_src)
+    spoken = []  # every string a person is shown: a flash, a JSON error, a plain-text answer, an audit detail, the alert
+    for node in _ast.walk(tree):
+        if not isinstance(node, _ast.Call):
+            continue
+        fn = node.func.id if isinstance(node.func, _ast.Name) else getattr(node.func, "attr", "")
+        if fn in ("flash", "jsonify", "Response", "_audit", "register_alert_type"):
+            parts = list(node.args) + [k.value for k in node.keywords]
+            if fn == "_audit":
+                parts = parts[2:]  # the action name and the object stay as they were
+            for part in parts:
+                spoken.extend(
+                    c.value for c in _ast.walk(part) if isinstance(c, _ast.Constant) and isinstance(c.value, str)
+                )
+    said_target = [s for s in spoken if "target" in s.lower()]
+    check(
+        len(spoken) > 20 and not said_target,
+        f"plugin.py: no flash, JSON error, plain-text answer, audit detail or alert text says target (got {said_target})",
+    )
+    check(
+        '_audit("DNSSYNC_ADD_TARGET", name,' in plugin_src
+        and '_audit("DNSSYNC_DELETE_TARGET", str(target_id), "DNS server removed")' in plugin_src
+        and '@bp.route("/targets/add", methods=["POST"])' in plugin_src
+        and "FROM ds_targets" in plugin_src,
+        "plugin.py: the audit action names, the route paths and the table name are the ones they were",
+    )
+    words = _re.sub(r"<script\b.*?</script>|\{#.*?#\}|\{%.*?%\}|\{\{.*?\}\}", " ", dns_page, flags=_re.S)
+    words = _re.sub(r"<[^>]+>", " ", words)
+    script = "".join(_re.findall(r"<script\b[^>]*>(.*?)</script>", dns_page, _re.S))
+    # the script's own two uses of the word are code, not sentences: the click event's target and the route path
+    script = script.replace("e.target === this", "").replace("'/network/dns-sync/targets/'", "")
+    said = _re.findall(r"[^\n]*target[^\n]*", script, _re.I)
+    check(
+        "target" not in words.lower() and not said,
+        f"index.html: no heading, label, button or script sentence says target (got {said})",
+    )
+    check(
+        dns_page.count("Add DNS Server") == 4
+        and "<th>DNS server</th>" in dns_page
+        and "This DNS server can now be enabled." in dns_page
+        and "'No records for this DNS server yet.'" in dns_page,
+        "index.html: the header button, the first step, the dialog and its submit say Add DNS Server; the column is DNS server",
+    )
+    quiet = []
+    w = load_plugin()  # an untouched copy, with only the loader, the flash and the redirect stood in
+    w._can = lambda sid: True
+    w.flash = lambda msg, cat="message": quiet.append(msg)
+    w.redirect = lambda where: "redirect"
+    w.url_for = lambda *a, **k: "/"
+    w._load_target = lambda tid: {"id": 9, "subnet_ids": "[1]", "enabled": 0, "previewed_at": None, "domain": "lan"}
+    w._get_db = lambda: (_ for _ in ()).throw(AssertionError("the database was touched"))
+    check(
+        w.toggle_target(9) == "redirect" and quiet == ["Run Preview before enabling a DNS server for the first time."],
+        f"toggle: a DNS server that was never previewed is refused, in the words the first-run card uses (got {quiet})",
+    )
+
+    # ── 1.1.6 (V52, addition 11): a page with no DNS server shows the first steps, not an empty table ────────────────
+    first = dns_page.find("{% if not rows %}\n{# v1.1.6")
+    other = dns_page.find('{% else %}\n<div class="card ds-card-flush">')
+    block = dns_page[first:other]
+    steps = _re.findall(r"<li>(.*?)</li>", block, _re.S)
+    step_count = len(steps)
+    steps += [""] * 3  # a page with fewer steps fails the checks below one by one; it does not stop the run
+    check(
+        0 < first < other and '<div class="card first-run">' in block and "<h3>Getting started</h3>" in block,
+        "index.html: with no DNS server the page shows one first-run card headed Getting started",
+    )
+    check(
+        step_count == 3
+        and 'class="btn btn-sm btn-primary ds-add-open">{{ icon("plus") }} Add DNS Server</button>' in steps[0]
+        and "{% if can_create %}" in steps[0],
+        f"index.html: the card has three steps and the first carries the Add DNS Server button, for who may add one (got {step_count})",
+    )
+    check(
+        "Jen refuses to enable a DNS server that was never previewed" in steps[1]
+        and "about 10 seconds after" in steps[1]
+        and "every 15 minutes" in steps[1]
+        and w._DEBOUNCE_DELAY_S == 10
+        and 'register_periodic(PLUGIN_ID, "reconcile", _reconcile_tick, 15)' in plugin_src
+        and 'if not row["enabled"] and not row["previewed_at"]:' in plugin_src,
+        "index.html: the second step's refusal, 10 seconds and 15 minutes are the route's rule, the debounce and the reconcile",
+    )
+    check(
+        '<a href="/settings/alerts">Settings - Alerts</a>' in steps[2]
+        and '"DNS Sync: sync failed"' in steps[2]
+        and 'label="DNS Sync: sync failed"' in plugin_src
+        and "scoped=True" in plugin_src,
+        "index.html: the third step links Settings - Alerts and names the alert by the label register() gives it",
+    )
+    check(
+        dns_page.find('<table id="ds-table"') > other
+        and "No targets yet" not in dns_page
+        and dns_page.count("{% if not rows %}") == 2,
+        "index.html: the table is drawn only when there is a DNS server (no empty-table row)",
+    )
+    check(
+        "document.querySelectorAll('.ds-add-open')" in dns_page
+        and 'id="ds-add-btn" class="btn btn-primary ds-add-open"' in dns_page
+        and "getElementById('ds-add-btn')" not in dns_page,
+        "index.html: the header's Add DNS Server button and the first step's open the same dialog",
+    )
+    check(
+        '<div class="ds-head-text">' in dns_page and ".ds-head-text{flex:1 1 300px;min-width:0}" in dns_page,
+        "index.html: the header's words shrink before the button wraps, so the button stays at the right on a tablet",
+    )
+    labels = []
+    for body in _re.findall(r"<button\b[^>]*>(.*?)</button>", dns_page, _re.S):
+        text = _re.sub(r"\{\{.*?\}\}|\{%.*?%\}|<[^>]+>", " ", body, flags=_re.S)
+        labels.extend(w for w in text.split() if w[:1].isalpha())
+    check(
+        labels and all(w[:1].isupper() for w in labels),
+        f"index.html: every button's words are Title Case (got {sorted(set(labels))})",
+    )
+    check(
+        _re.search(r"\sstyle\s*=", dns_page) is None
+        and dns_page.count("<script") == dns_page.count('<script nonce="{{ csp_nonce }}">'),
+        "index.html: the new markup carries no inline style and every script tag has its nonce",
     )
 
     if failures:
